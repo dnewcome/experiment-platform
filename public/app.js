@@ -11,12 +11,28 @@ const api = {
   del:  (path)       => fetch(`/api${path}`, { method: 'DELETE' }).then(r => r.json()),
 };
 
+// Ensure an allocation received from the API always has splits as an array
+// and targeting_rules as an object/null — guards against the server sending
+// raw JSON strings if parseAllocation wasn't called on the response.
+function normalizeAlloc(alloc) {
+  return {
+    ...alloc,
+    splits:          Array.isArray(alloc.splits) ? alloc.splits : JSON.parse(alloc.splits ?? '[]'),
+    targeting_rules: alloc.targeting_rules && typeof alloc.targeting_rules === 'string'
+      ? JSON.parse(alloc.targeting_rules)
+      : (alloc.targeting_rules ?? null),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Rule Builder — outputs JSON Logic
 // ---------------------------------------------------------------------------
 
-const OPERATORS_TEXT   = ['==', '!=', 'contains', 'not_contains', 'starts_with', 'in'];
-const OPERATORS_NUMBER = ['==', '!=', '>', '>=', '<', '<='];
+const OPERATORS_TEXT   = ['==', '!=', 'contains', 'not_contains', 'starts_with', 'one_of', 'not_one_of'];
+const OPERATORS_NUMBER = ['==', '!=', '>', '>=', '<', '<=', 'one_of', 'not_one_of'];
+
+// Operators that take a list of values (one per line) instead of a single value
+const LIST_OPERATORS = new Set(['one_of', 'not_one_of']);
 
 function getOperators(field) {
   return field?.inputType === 'number' ? OPERATORS_NUMBER : OPERATORS_TEXT;
@@ -49,9 +65,15 @@ function ruleToJsonLogic(rule, fields) {
     case 'contains':     return { 'in':  [val, v] };
     case 'not_contains': return { '!':   [{ 'in': [val, v] }] };
     case 'starts_with':  return { '===': [{ substr: [v, 0, String(val).length] }, val] };
-    case 'in':           return { 'in':  [v, String(val).split(',').map(s => s.trim())] };
+    case 'one_of':       return { 'in':  [v, parseList(rule.value)] };
+    case 'not_one_of':   return { '!':   [{ 'in': [v, parseList(rule.value)] }] };
     default:             return { '==':  [v, val] };
   }
+}
+
+// Parse a newline-separated list of values, trimming whitespace and dropping blanks
+function parseList(raw) {
+  return String(raw).split('\n').map(s => s.trim()).filter(Boolean);
 }
 
 function groupToJsonLogic(group, fields) {
@@ -66,6 +88,7 @@ function extractQuery(targeting_rules) {
 function RuleCondition({ rule, fields, onChange, onRemove }) {
   const fieldDef  = fields.find(f => f.name === rule.field) ?? fields[0];
   const operators = getOperators(fieldDef);
+  const isList    = LIST_OPERATORS.has(rule.operator);
 
   function update(patch) {
     const updated = { ...rule, ...patch };
@@ -73,24 +96,46 @@ function RuleCondition({ rule, fields, onChange, onRemove }) {
       const ops = getOperators(fields.find(f => f.name === patch.field));
       if (!ops.includes(updated.operator)) updated.operator = ops[0];
     }
+    // Reset value when switching between list and non-list operators
+    if (patch.operator && LIST_OPERATORS.has(patch.operator) !== LIST_OPERATORS.has(rule.operator)) {
+      updated.value = '';
+    }
     onChange(updated);
   }
 
+  const isList2 = LIST_OPERATORS.has(rule.operator);
+  const count   = isList2 ? parseList(rule.value).length : null;
+
   return (
-    <div className="rule-row">
+    <div className="rule-row" style={{ alignItems: isList2 ? 'flex-start' : 'center' }}>
       <select value={rule.field} onChange={e => update({ field: e.target.value })}>
         {fields.map(f => <option key={f.name} value={f.name}>{f.label}</option>)}
       </select>
       <select value={rule.operator} onChange={e => update({ operator: e.target.value })}>
-        {operators.map(op => <option key={op} value={op}>{op}</option>)}
+        {operators.map(op => <option key={op} value={op}>{op.replace('_', ' ')}</option>)}
       </select>
-      <input
-        value={rule.value}
-        onChange={e => update({ value: e.target.value })}
-        placeholder={rule.operator === 'in' ? 'a, b, c' : 'value'}
-        style={{ width: 140 }}
-      />
-      <button className="btn btn-xs btn-danger" onClick={onRemove}>×</button>
+      {isList2
+        ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <textarea
+              value={rule.value}
+              onChange={e => update({ value: e.target.value })}
+              placeholder={"one value per line\nUS\nCA\nGB"}
+              style={{ width: 180, height: 80, fontSize: 12, padding: '4px 7px', border: '1px solid #ccc', borderRadius: 4, resize: 'vertical', fontFamily: 'monospace' }}
+            />
+            <span style={{ fontSize: 11, color: '#888' }}>{count} value{count !== 1 ? 's' : ''}</span>
+          </div>
+        )
+        : (
+          <input
+            value={rule.value}
+            onChange={e => update({ value: e.target.value })}
+            placeholder="value"
+            style={{ width: 140 }}
+          />
+        )
+      }
+      <button className="btn btn-xs btn-danger" onClick={onRemove} style={{ alignSelf: isList2 ? 'flex-start' : 'center' }}>×</button>
     </div>
   );
 }
@@ -347,7 +392,8 @@ function FlagList({ onSelectFlag }) {
 // ---------------------------------------------------------------------------
 
 function AllocationModal({ flag, editAlloc, onSave, onClose }) {
-  const initSplits = editAlloc?.splits ?? flag.variants.map(v => ({ variant_key: v.key, weight: 0 }));
+  const rawSplits  = editAlloc ? normalizeAlloc(editAlloc).splits : null;
+  const initSplits = rawSplits ?? flag.variants.map(v => ({ variant_key: v.key, weight: 0 }));
   const [splits,   setSplits]   = useState(initSplits);
   const [priority, setPriority] = useState(editAlloc?.priority ?? 0);
   const [catchAll, setCatchAll] = useState(!editAlloc?.targeting_rules);
@@ -451,11 +497,13 @@ function FlagDetail({ flagId, onBack }) {
     if (editAlloc) {
       res = await api.put(`/flags/${flagId}/allocations/${editAlloc.id}`, data);
       if (res.error) return res;
-      setFlag(f => ({ ...f, allocations: f.allocations.map(a => a.id === editAlloc.id ? res : a) }));
+      const norm = normalizeAlloc(res);
+      setFlag(f => ({ ...f, allocations: f.allocations.map(a => a.id === editAlloc.id ? norm : a) }));
     } else {
       res = await api.post(`/flags/${flagId}/allocations`, data);
       if (res.error) return res;
-      setFlag(f => ({ ...f, allocations: [...f.allocations, res].sort((a, b) => a.priority - b.priority) }));
+      const norm = normalizeAlloc(res);
+      setFlag(f => ({ ...f, allocations: [...f.allocations, norm].sort((a, b) => a.priority - b.priority) }));
     }
     setEditAlloc(null);
   }
@@ -588,7 +636,7 @@ function FlagDetail({ flagId, onBack }) {
                   <tr key={alloc.id}>
                     <td style={{ color: '#888' }}>{alloc.priority}</td>
                     <td>
-                      {alloc.splits.map(s => (
+                      {(alloc.splits ?? []).map(s => (
                         <span key={s.variant_key} style={{ marginRight: 8, whiteSpace: 'nowrap' }}>
                           <span className="flag-key">{s.variant_key}</span>
                           <span className="muted" style={{ marginLeft: 4 }}>{s.weight}%</span>
@@ -673,6 +721,9 @@ function EvaluateView() {
     setLoading(true);
     let body;
     try { body = JSON.parse(payload); } catch { setError('Invalid JSON in payload'); setLoading(false); return; }
+    // Randomize user_id on every run so repeated clicks produce different bucket assignments
+    body = { ...body, user_id: 'user-' + Math.floor(Math.random() * 1000000) };
+    setPayload(JSON.stringify(body, null, 2));
     const res = await api.post('/evaluate', body);
     setResult(res);
     setLoading(false);
