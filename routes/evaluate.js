@@ -1,22 +1,5 @@
-import { createRequire } from 'module';
-import crypto from 'crypto';
 import db from '../db/index.js';
-
-const require = createRequire(import.meta.url);
-const jsonLogic = require('json-logic-js');
-
-function getBucket(userId, flagKey) {
-  const hash = crypto.createHash('md5').update(`${flagKey}/${userId}`).digest('hex');
-  return parseInt(hash.slice(0, 8), 16) % 100;
-}
-
-function parseValue(rawValue, type) {
-  switch (type) {
-    case 'boolean': return rawValue === 'true' || rawValue === true;
-    case 'json':    try { return JSON.parse(rawValue); } catch { return rawValue; }
-    default:        return rawValue;
-  }
-}
+import { getBucket, parseValue, evaluateFlag } from '../lib/evaluate.js';
 
 async function logAssignment(flagKey, userId, attributes, result) {
   try {
@@ -60,55 +43,54 @@ export default async function evaluateRoute(app) {
     return { ok: true };
   });
 
+  // POST /assignments — log a pre-computed assignment from the SDK.
+  // The SDK evaluates locally; this endpoint records the result without re-evaluating.
+  app.post('/assignments', async (req, reply) => {
+    const { flag_key, user_id, variant, value, reason, bucket, allocation_id, attributes } = req.body;
+    if (!flag_key || !user_id || !reason)
+      return reply.code(400).send({ error: 'flag_key, user_id, and reason are required' });
+    await db.run(
+      `INSERT INTO experiment_assignments
+         (flag_key, user_id, variant, value, reason, bucket, allocation_id, attributes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        flag_key,
+        user_id,
+        variant      ?? null,
+        value        !== undefined ? JSON.stringify(value) : null,
+        reason,
+        bucket       ?? null,
+        allocation_id ?? null,
+        JSON.stringify(attributes ?? {}),
+      ],
+    );
+    return { ok: true };
+  });
+
   app.post('/evaluate', async (req, reply) => {
     const { flag_key, user_id, attributes = {} } = req.body;
     if (!flag_key || !user_id)
       return reply.code(400).send({ error: 'flag_key and user_id are required' });
 
-    const flag = await db.get('SELECT * FROM flags WHERE key = ?', [flag_key]);
-    if (!flag) return reply.code(404).send({ error: `Flag "${flag_key}" not found` });
+    const row = await db.get('SELECT * FROM flags WHERE key = ?', [flag_key]);
+    if (!row) return reply.code(404).send({ error: `Flag "${flag_key}" not found` });
 
-    if (!flag.enabled) {
-      const r = { variant: null, value: null, reason: 'flag_disabled' };
-      await logAssignment(flag_key, user_id, attributes, r);
-      return r;
-    }
+    const variants    = await db.all('SELECT * FROM variants WHERE flag_id = ?', [row.id]);
+    const allocations = await db.all('SELECT * FROM allocations WHERE flag_id = ? ORDER BY priority ASC', [row.id]);
 
-    const allocations = await db.all('SELECT * FROM allocations WHERE flag_id = ? ORDER BY priority ASC', [flag.id]);
-    const variants    = await db.all('SELECT * FROM variants WHERE flag_id = ?', [flag.id]);
-    const bucket      = getBucket(user_id, flag_key);
-    const ctx         = { ...attributes, user_id };
+    // Build the same shape that the SDK cache holds (parsed JSON fields)
+    const flag = {
+      ...row,
+      enabled:     !!row.enabled,
+      variants,
+      allocations: allocations.map(a => ({
+        ...a,
+        splits:          JSON.parse(a.splits),
+        targeting_rules: a.targeting_rules ? JSON.parse(a.targeting_rules) : null,
+      })),
+    };
 
-    for (const alloc of allocations) {
-      if (alloc.targeting_rules) {
-        const matched = jsonLogic.apply(JSON.parse(alloc.targeting_rules), ctx);
-        if (!matched) continue;
-      }
-
-      const splits = JSON.parse(alloc.splits);
-      let cursor = 0;
-      for (const split of splits) {
-        cursor += split.weight;
-        if (bucket < cursor) {
-          const variant = variants.find(v => v.key === split.variant_key);
-          const r = {
-            variant:       split.variant_key,
-            value:         variant ? parseValue(variant.value, flag.type) : null,
-            reason:        'allocated',
-            bucket,
-            allocation_id: alloc.id,
-          };
-          await logAssignment(flag_key, user_id, attributes, r);
-          return r;
-        }
-      }
-
-      const r = { variant: null, value: null, reason: 'split_exhausted', bucket };
-      await logAssignment(flag_key, user_id, attributes, r);
-      return r;
-    }
-
-    const r = { variant: null, value: null, reason: 'no_matching_allocation', bucket };
+    const r = evaluateFlag(flag, user_id, attributes);
     await logAssignment(flag_key, user_id, attributes, r);
     return r;
   });

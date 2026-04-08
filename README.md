@@ -7,13 +7,20 @@ A self-hosted feature flagging and experimentation platform. Designed as a repla
 ```
 ┌─────────────────────────────────────────────────────┐
 │  Browser UI (React, no build step)                  │
-│  Flags · Evaluate · Assignments                     │
+│  Flags · Evaluate · Assignments · Simulate          │
 └─────────────────────┬───────────────────────────────┘
                       │ HTTP
-┌─────────────────────▼───────────────────────────────┐
-│  Fastify API                                        │
-│  /api/flags   /api/evaluate   /api/assignments      │
-└─────────────────────┬───────────────────────────────┘
+┌─────────────────────▼───────────────────────────────┐  ┌──────────────────────────┐
+│  Fastify API                                        │  │  Node.js SDK             │
+│  /api/flags        /api/sdk/config                  │  │  sdk/index.js            │
+│  /api/evaluate     /api/assignments                 │  │                          │
+└─────────────────────┬───────────────────────────────┘  │  polls /api/sdk/config   │
+                      │                 ▲                 │  evaluates locally       │
+┌─────────────────────▼───────────────┐ │                 │  logs via POST           │
+│  lib/evaluate.js (shared core)      │─┘                 │  /api/assignments        │
+│  getBucket · parseValue             │◄──────────────────┘
+│  evaluateFlag                       │
+└─────────────────────┬───────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────┐
 │  SQLite (better-sqlite3, WAL mode)                  │
@@ -227,15 +234,225 @@ experiment_assignments (
 ]
 ```
 
+## Simulation & Statistical Analysis
+
+The **Simulate** tab lets you design experiments before running them, and understand the statistics behind A/B test results.
+
+### How it works
+
+Pick a flag, set a simulated number of users, and configure the **true conversion rate** per variant — the ground-truth probability you're pretending to know. The simulator draws synthetic users, assigns them to variants according to the flag's real split weights, generates Bernoulli-distributed outcomes, then runs two statistical tests on the result.
+
+The random seed makes runs reproducible: the same seed + same config = the same dataset. Changing the seed redraws from the same distribution, which is useful for understanding sampling variance.
+
+### Frequentist test — two-proportion z-test
+
+Tests the null hypothesis that both variants have the same true conversion rate.
+
+```
+z = (p̂₁ − p̂₂) / SE_pool
+
+SE_pool = √( p̄(1−p̄) · (1/n₁ + 1/n₂) )
+
+p̄ = (n₁p̂₁ + n₂p̂₂) / (n₁ + n₂)   ← weighted pooled proportion
+```
+
+The p-value is two-sided at α = 0.05. A result is "statistically significant" if p < 0.05, meaning that if the null were true, you'd see a difference this large less than 5% of the time by chance alone.
+
+**What the p-value does not tell you:** the probability that treatment is better than control, the size of the effect, or whether the result is practically meaningful.
+
+### Bayesian test — Beta-Binomial
+
+Uses a Beta(1,1) uninformative prior (equivalent to having seen zero previous data). After observing the data, the posterior for each arm's true rate is:
+
+```
+posterior ∝ Beta(1 + conversions, 1 + non-conversions)
+```
+
+The posterior is approximated as normal for large n, which lets us compute:
+
+```
+P(treatment > control) = Φ( (μ₂ − μ₁) / √(σ₁² + σ₂²) )
+```
+
+where μ and σ² are the posterior mean and variance of each Beta.
+
+This produces a direct probability statement: "there is an 87% chance treatment converts better than control, given the data." Unlike a p-value, this can be read at face value and updated as more data arrives.
+
+The 95% credible interval on the difference can also be interpreted directly: "there is a 95% probability the true difference lies in this range" — which is what most people incorrectly believe a frequentist confidence interval means.
+
+### Power and sample size
+
+**Achieved power** is the probability you would detect the true effect (if it exists) at α = 0.05, given the sample sizes in this simulation. It uses the actual observed arm sizes n₁ and n₂ and the weighted pooled SE under H₀:
+
+```
+power = Φ( (|p₁ − p₂| − 1.96 · SE_null) / SE_alt )
+
+SE_null = √( p̄(1−p̄) · (1/n₁ + 1/n₂) )
+SE_alt  = √( p₁(1−p₁)/n₁ + p₂(1−p₂)/n₂ )
+```
+
+**Required total N** is solved analytically for 80% power (z_β = 0.842) at the flag's actual allocation weights w₁ and w₂:
+
+```
+N = ( 1.96·√(p̄(1−p̄)·(1/w₁+1/w₂))  +  0.842·√(p₁(1−p₁)/w₁ + p₂(1−p₂)/w₂) )²
+    ─────────────────────────────────────────────────────────────────────────────
+                              (p₁ − p₂)²
+```
+
+This correctly accounts for unequal allocation. A 90/10 split requires substantially more total users than a 50/50 split for the same effect size, because the minority arm accumulates observations slowly and dominates the variance. The required N and power warning in the UI both display the actual split ratio so this trade-off is visible.
+
+### Significance, power, and the winner's curse
+
+α = 0.05 is the significance threshold. A result is flagged significant when p < 0.05, meaning the observed difference would occur less than 5% of the time by chance if the null hypothesis were true.
+
+Power and significance measure different things and both matter:
+
+| State | Meaning |
+|---|---|
+| Significant + well-powered (≥ 60%) | Result is reliable. The observed effect is a reasonable estimate of the true effect. |
+| Significant + underpowered (< 60%) | **Winner's curse.** The result is real in the frequentist sense, but the estimated effect size is probably inflated. |
+| Not significant + underpowered | Inconclusive. You can't distinguish "no effect" from "effect too small to detect." |
+| Not significant + well-powered | Genuine null result. You had enough data to detect a real effect and didn't find one. |
+
+**Why significant + underpowered is dangerous (the winner's curse):**
+
+With low power and a small sample, you can only cross p < 0.05 if the *observed* difference happens to be large — which means you need sampling noise to push the estimate up. The specific runs that come up significant are the ones where noise inflated the apparent effect. The true effect, measured with a much larger sample, would typically be smaller.
+
+This is a Type M error (error in **m**agnitude): you detected that something is going on, but you're overestimating how big it is. Decisions made on winner's curse results — "this feature boosted conversion by 8%, ship it!" — tend not to replicate.
+
+You can verify this in the simulator: configure a small true effect (e.g. 10% vs 11%), set N = 500, and re-roll the seed repeatedly. Most runs will be non-significant. The ones that turn significant will show observed differences much larger than 1pp. That gap between what you set and what you observe in significant-only runs is the winner's curse in action.
+
+**The 60% power threshold** used to separate green from amber in the UI is a practical judgement call, not a hard statistical rule. 80% is the conventional target for experiment design. Results between 60–80% are flagged with a softer warning; below 60% alongside a significant result triggers the winner's curse warning.
+
+### CUPED (planned)
+
+CUPED (Controlled-experiment Using Pre-Experiment Data) is a variance reduction technique that uses a pre-experiment covariate (e.g., a user's conversion rate in the week before the experiment) to reduce noise in the metric. The adjustment is:
+
+```
+Y_adj = Y − θ·(X − mean(X))
+θ = Cov(Y, X) / Var(X)
+```
+
+Because X is measured before treatment assignment it cannot be affected by the treatment, so the adjusted metric has the same expected value but lower variance — often 20–40% reduction. This means you need 20–40% fewer users for the same power. Simulation support for CUPED (including a correlated pre-period covariate) is planned once continuous metrics are added.
+
 ## UI
 
-Three tabs:
+Four tabs:
 
 **Flags** — Create and manage flags. Toggle on/off. Click into a flag to manage variants, define targeting attribute fields, and build allocations.
 
 **Evaluate** — Test any flag evaluation in the browser. Pick a flag to pre-populate a sample payload, edit the `user_id` and `attributes`, then run it. The page shows the full JSON response and an equivalent `curl` command you can copy.
 
 **Assignments** — Live view of the `experiment_assignments` table. Filter by flag, paginate, clear. Click `{…}` in the Attributes column to inspect the full context that was evaluated.
+
+**Simulate** — Design experiments before launch. Configure true conversion rates per variant, run a synthetic dataset through both frequentist and Bayesian tests, and see power analysis accounting for your flag's actual split weights.
+
+## Node.js SDK
+
+The SDK evaluates flags locally — no network call per evaluation. It fetches the full flag config on startup and re-polls every 60 seconds. Assignment logging is explicit: the SDK never logs on its own, you call `logAssignment()` when you're ready to record.
+
+### Setup
+
+```js
+import { ExperimentClient } from './sdk/index.js';
+
+const client = new ExperimentClient({
+  host:            'http://localhost:3000',
+  pollingInterval: 60_000,           // optional, default 60s
+  onError:         e => console.error('[experiment]', e.message), // optional
+});
+
+await client.init();
+```
+
+`init()` blocks until the first config fetch completes. After that, polling runs in the background and does not prevent the Node process from exiting.
+
+### Evaluating a flag
+
+```js
+const result = client.evaluate('my-flag', 'user-123', {
+  country: 'US',
+  plan:    'enterprise',
+});
+// { variant: 'treatment', value: true, reason: 'allocated', bucket: 42, allocation_id: 1 }
+```
+
+Evaluation is fully synchronous. The result object matches the shape returned by `POST /api/evaluate`.
+
+**Reason codes:**
+
+| Reason | Meaning |
+|---|---|
+| `allocated` | User matched an allocation and landed in a split |
+| `flag_disabled` | Flag is toggled off |
+| `no_matching_allocation` | No allocation's targeting rules matched |
+| `split_exhausted` | Targeting matched but splits don't cover the bucket (misconfiguration) |
+| `unknown_flag` | Flag key not found in the cached config |
+
+### Logging assignments
+
+```js
+// Fire-and-forget — returns immediately, does not block
+client.logAssignment('my-flag', 'user-123', result, { country: 'US', plan: 'enterprise' });
+```
+
+This POSTs to `POST /api/assignments` asynchronously. Errors are routed to `onError` if configured, otherwise silently swallowed. The stale config is always retained on fetch failures so in-flight traffic is unaffected.
+
+You control when logging happens — log after every evaluation, or batch them, or skip logging entirely for internal health checks.
+
+### Shutdown
+
+```js
+client.close(); // clears the polling interval
+```
+
+### How the SDK config endpoint works
+
+`GET /api/sdk/config` returns all enabled flags with their variants and allocations in a single response. The SDK caches this as a `Map<flagKey, flag>` and evaluates entirely from memory.
+
+Bucket computation, targeting rule evaluation, and split assignment are implemented in `lib/evaluate.js`, which is imported by both the API route and the SDK. This structural sharing guarantees that `client.evaluate()` and `POST /api/evaluate` will always produce identical results for the same input — there is no separate implementation to drift.
+
+Disabled flags are excluded from the config snapshot. If a flag is disabled between polls, the SDK will continue serving the last known state for up to one polling interval.
+
+## Testing
+
+```sh
+npm test
+```
+
+Uses Node.js's built-in test runner (`node:test`), no extra dependencies.
+
+### What's covered
+
+Tests live in `test/evaluate.test.js` and target `lib/evaluate.js` — the shared core that both the API and SDK depend on.
+
+**`getBucket`**
+- Output is always in [0, 99]
+- Deterministic: same inputs always return the same bucket
+- Sensitive to `userId`: 200 distinct users cover > 80% of buckets
+- Sensitive to `flagKey`: same user gets independent buckets across flags
+- Regression values against known server output (guards against accidental algorithm changes)
+
+**`parseValue`**
+- `boolean` type: `"true"` → `true`, `"false"` → `false`, actual boolean passthrough
+- `json` type: valid JSON string parsed, invalid JSON returned as-is
+- `string` and unknown types: value returned unchanged
+
+**`evaluateFlag`**
+- Disabled flag returns `flag_disabled`
+- No allocations returns `no_matching_allocation`
+- 50/50 split: users with bucket < 50 get control, ≥ 50 get treatment
+- Result includes correct `bucket` and `allocation_id`
+- `result.bucket` always equals `getBucket(userId, flagKey)`
+- `split_exhausted` when splits don't cover the full 0–99 range and bucket falls in the gap
+- Targeting rule match/no-match
+- `user_id` is automatically injected into the targeting context
+- Multi-allocation priority: first matching allocation wins
+- Split referencing a missing variant key returns `null` value without crashing
+
+### Architecture note
+
+The test suite is also a contract: because both the API route (`routes/evaluate.js`) and the SDK (`sdk/index.js`) import from `lib/evaluate.js`, passing these tests is sufficient to guarantee consistent behavior across both consumers. If you ever need to change the evaluation algorithm, update `lib/evaluate.js` and the tests — both consumers get the change automatically.
 
 ## Extending
 

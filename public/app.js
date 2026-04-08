@@ -961,22 +961,45 @@ function zTestProportions(n1, x1, n2, x2) {
   return { p1, p2, z, pValue, diff: p1 - p2, ci95lo: (p1-p2) - 1.96*seDiff, ci95hi: (p1-p2) + 1.96*seDiff };
 }
 
-// Achieved power given n per arm, two true rates, alpha=0.05 two-sided
-function computePower(n, p1, p2) {
-  const pBar = (p1 + p2) / 2;
-  const seNull = Math.sqrt(2 * pBar * (1-pBar) / n);
-  const seAlt  = Math.sqrt((p1*(1-p1) + p2*(1-p2)) / n);
-  const zAlpha = 1.96;
-  const zBeta  = (Math.abs(p1-p2) - zAlpha * seNull) / seAlt;
+// Achieved power given actual arm sizes n1, n2 and true rates p1, p2.
+// Uses the weighted pooled proportion under H0, so unequal splits are handled correctly.
+function computePower(n1, n2, p1, p2) {
+  const pBar   = (n1*p1 + n2*p2) / (n1 + n2);
+  const seNull = Math.sqrt(pBar * (1-pBar) * (1/n1 + 1/n2));
+  const seAlt  = Math.sqrt(p1*(1-p1)/n1 + p2*(1-p2)/n2);
+  const zBeta  = (Math.abs(p1-p2) - 1.96 * seNull) / seAlt;
   return normalCDF(zBeta);
 }
 
-// Sample size per arm for 80% power at alpha=0.05
-function requiredN(p1, p2) {
-  const pBar  = (p1 + p2) / 2;
-  const num   = (1.96 * Math.sqrt(2 * pBar * (1-pBar)) + 0.842 * Math.sqrt(p1*(1-p1) + p2*(1-p2))) ** 2;
-  const denom = (p1 - p2) ** 2;
-  return Math.ceil(num / denom);
+// Required TOTAL sample size for 80% power at alpha=0.05, given fractional
+// allocation weights w1 (control) and w2 (treatment) that sum to 1.
+// Unequal splits are less efficient — required N rises as the ratio departs from 50/50.
+function requiredNTotal(p1, p2, w1, w2) {
+  const pBar = w1*p1 + w2*p2;
+  const num  = (1.96 * Math.sqrt(pBar*(1-pBar)*(1/w1 + 1/w2)) + 0.842 * Math.sqrt(p1*(1-p1)/w1 + p2*(1-p2)/w2)) ** 2;
+  return Math.ceil(num / (p1-p2) ** 2);
+}
+
+// Bayesian Beta-Binomial test (uninformative Beta(1,1) prior).
+// Uses normal approximation to the Beta posterior — accurate for n > ~30.
+// Returns { probBgtA, posteriorMeanA, posteriorMeanB, credLo, credHi, relLift }
+function bayesianTest(n1, x1, n2, x2) {
+  // Posterior parameters: Beta(1 + conversions, 1 + non-conversions)
+  const a1 = 1 + x1,  b1 = 1 + (n1 - x1);
+  const a2 = 1 + x2,  b2 = 1 + (n2 - x2);
+  const mu1  = a1 / (a1 + b1);
+  const mu2  = a2 / (a2 + b2);
+  const var1 = (a1 * b1) / ((a1+b1)**2 * (a1+b1+1));
+  const var2 = (a2 * b2) / ((a2+b2)**2 * (a2+b2+1));
+  // P(treatment > control): difference of two approx-normals
+  const z          = (mu2 - mu1) / Math.sqrt(var1 + var2);
+  const probBgtA   = normalCDF(z);
+  // 95% credible interval on the absolute difference
+  const seDiff = Math.sqrt(var1 + var2);
+  const credLo = (mu2 - mu1) - 1.96 * seDiff;
+  const credHi = (mu2 - mu1) + 1.96 * seDiff;
+  const relLift = mu1 > 0 ? (mu2 - mu1) / mu1 : 0;
+  return { probBgtA, posteriorMeanA: mu1, posteriorMeanB: mu2, credLo, credHi, relLift };
 }
 
 // Seeded PRNG (mulberry32) — reproducible runs given same seed
@@ -1059,17 +1082,31 @@ function SimulateView() {
       const n1 = counts[controlKey], x1 = conversions[controlKey];
       const n2 = counts[v.key],      x2 = conversions[v.key];
       if (!n1 || !n2) continue;
+      const p1true = parseFloat(varCfg[controlKey]?.rate ?? 0.1);
+      const p2true = parseFloat(varCfg[v.key]?.rate    ?? 0.1);
+      // Extract fractional weights from the allocation splits for this pair
+      const sp1 = splits.find(s => s.variant_key === controlKey);
+      const sp2 = splits.find(s => s.variant_key === v.key);
+      const w1  = (sp1?.weight ?? 50) / 100;
+      const w2  = (sp2?.weight ?? 50) / 100;
       const t   = zTestProportions(n1, x1, n2, x2);
-      const pow = computePower(Math.min(n1, n2), parseFloat(varCfg[controlKey]?.rate ?? 0.1), parseFloat(varCfg[v.key]?.rate ?? 0.1));
-      const req = requiredN(parseFloat(varCfg[controlKey]?.rate ?? 0.1), parseFloat(varCfg[v.key]?.rate ?? 0.1));
-      tests.push({ variantKey: v.key, ...t, power: pow, requiredN: req });
+      const pow = computePower(n1, n2, p1true, p2true);
+      const req = requiredNTotal(p1true, p2true, w1, w2);
+      const bay = bayesianTest(n1, x1, n2, x2);
+      tests.push({ variantKey: v.key, ...t, power: pow, requiredNTotal: req, w1, w2, bay });
     }
 
     setResults({ counts, conversions, tests, controlKey });
   }
 
-  function pColor(p) { return p < 0.05 ? '#155724' : p < 0.1 ? '#856404' : '#721c24'; }
-  function pBg(p)    { return p < 0.05 ? '#d4edda'  : p < 0.1 ? '#fff3cd' : '#f8d7da'; }
+  // Verdict combines significance AND power.
+  // Significant + underpowered = "winner's curse" risk — show amber, not green.
+  function verdictStyle(pValue, power) {
+    if (pValue < 0.05 && power >= 0.6) return { bg: '#d4edda', tx: '#155724' }; // green — significant & adequately powered
+    if (pValue < 0.05 && power <  0.6) return { bg: '#fff3cd', tx: '#856404' }; // amber — significant but underpowered
+    if (pValue < 0.1)                  return { bg: '#fff3cd', tx: '#856404' }; // amber — marginal
+    return                                    { bg: '#f8d7da', tx: '#721c24' }; // red   — not significant
+  }
   function pct(n)    { return (n * 100).toFixed(2) + '%'; }
   function fmt(n, d=3) { return n.toFixed(d); }
   function pp(n)     { return (n >= 0 ? '+' : '') + (n*100).toFixed(2) + 'pp'; }
@@ -1194,9 +1231,9 @@ function SimulateView() {
           </div>
 
           <div className="card">
-            <h2 style={{ marginBottom: 4 }}>Statistical Tests</h2>
+            <h2 style={{ marginBottom: 2 }}>Frequentist — Two-proportion z-test</h2>
             <div className="muted" style={{ marginBottom: 16, fontSize: 12 }}>
-              Two-proportion z-test, two-sided, α = 0.05. Each treatment arm vs. control.
+              Two-sided, α = 0.05. Each treatment arm vs. control. Answers: "is the observed difference unlikely under the null hypothesis?"
             </div>
             {results.tests.length === 0
               ? <div className="muted">No treatment arms to test.</div>
@@ -1205,36 +1242,99 @@ function SimulateView() {
                   <div style={{ fontWeight: 600, marginBottom: 10 }}>
                     <span className="flag-key">{t.variantKey}</span> vs <span className="flag-key">{results.controlKey}</span>
                   </div>
-                  <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
                     {[
-                      ['z-statistic', fmt(t.z)],
-                      ['p-value',     fmt(t.pValue, 4)],
-                      ['Observed diff', pp(t.diff)],
-                      ['95% CI', `[${pp(t.ci95lo)}, ${pp(t.ci95hi)}]`],
-                      ['Power (this N)', pct(t.power)],
-                      ['N for 80% power', (t.requiredN * 2).toLocaleString() + ' total'],
+                      ['z-statistic',     fmt(t.z)],
+                      ['p-value',         fmt(t.pValue, 4)],
+                      ['Observed diff',   pp(t.diff)],
+                      ['95% CI',          `[${pp(t.ci95lo)}, ${pp(t.ci95hi)}]`],
+                      ['Power (this N)',   pct(t.power)],
+                      ['N for 80% power', t.requiredNTotal.toLocaleString() + ` total (${Math.round(t.w1*100)}/${Math.round(t.w2*100)} split)`],
                     ].map(([label, val]) => (
-                      <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '10px 16px', minWidth: 140 }}>
+                      <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '10px 16px', minWidth: 130 }}>
                         <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>{label}</div>
                         <div style={{ fontFamily: 'monospace', fontWeight: 600 }}>{val}</div>
                       </div>
                     ))}
                   </div>
-                  <div style={{ display: 'inline-block', padding: '6px 14px', borderRadius: 6, fontWeight: 700, fontSize: 13, background: pBg(t.pValue), color: pColor(t.pValue) }}>
-                    {t.pValue < 0.05
-                      ? `Statistically significant (p = ${fmt(t.pValue,4)})`
+                  {(() => {
+                    const { bg, tx } = verdictStyle(t.pValue, t.power);
+                    const sigText = t.pValue < 0.05
+                      ? t.power < 0.6
+                        ? `Significant but underpowered (p = ${fmt(t.pValue,4)}) — effect size likely inflated`
+                        : `Statistically significant (p = ${fmt(t.pValue,4)})`
                       : t.pValue < 0.1
-                        ? `Marginal (p = ${fmt(t.pValue,4)}) — not significant at α=0.05`
-                        : `Not significant (p = ${fmt(t.pValue,4)})`
-                    }
-                  </div>
-                  {t.power < 0.8 && (
+                        ? `Marginal (p = ${fmt(t.pValue,4)}) — not significant at α = 0.05`
+                        : `Not significant (p = ${fmt(t.pValue,4)})`;
+                    return (
+                      <div style={{ display: 'inline-block', padding: '6px 14px', borderRadius: 6, fontWeight: 700, fontSize: 13, background: bg, color: tx }}>
+                        {sigText}
+                      </div>
+                    );
+                  })()}
+                  {t.power < 0.6 && (
+                    <div style={{ marginTop: 8, fontSize: 12, color: '#856404', background: '#fff3cd', padding: '6px 12px', borderRadius: 5, display: 'block', maxWidth: 560, lineHeight: 1.5 }}>
+                      ⚠ Only {pct(t.power)} power — this experiment is underpowered. {t.pValue < 0.05 ? 'The significant result is likely a winner\'s curse: sampling noise inflated the observed effect. ' : ''}Need {t.requiredNTotal.toLocaleString()} total users for 80% power at this {Math.round(t.w1*100)}/{Math.round(t.w2*100)} split.
+                    </div>
+                  )}
+                  {t.power >= 0.6 && t.power < 0.8 && (
                     <div style={{ marginTop: 8, fontSize: 12, color: '#856404', background: '#fff3cd', padding: '6px 12px', borderRadius: 5, display: 'inline-block' }}>
-                      ⚠ Only {pct(t.power)} power with this sample size. Need {(t.requiredN * 2).toLocaleString()} total users for 80% power.
+                      ⚠ {pct(t.power)} power — below 80% target. Need {t.requiredNTotal.toLocaleString()} total users at this {Math.round(t.w1*100)}/{Math.round(t.w2*100)} split.
                     </div>
                   )}
                 </div>
               ))
+            }
+          </div>
+
+          <div className="card">
+            <h2 style={{ marginBottom: 2 }}>Bayesian — Beta-Binomial</h2>
+            <div className="muted" style={{ marginBottom: 16, fontSize: 12 }}>
+              Uninformative Beta(1,1) prior. Answers: "given the data, what is the probability treatment is better than control?"
+            </div>
+            {results.tests.length === 0
+              ? <div className="muted">No treatment arms to test.</div>
+              : results.tests.map(t => {
+                const b = t.bay;
+                const probPct = pct(b.probBgtA);
+                const isWinner = b.probBgtA >= 0.95;
+                const isLoser  = b.probBgtA <= 0.05;
+                const bgColor  = isWinner ? '#d4edda' : isLoser ? '#f8d7da' : '#fff3cd';
+                const txColor  = isWinner ? '#155724' : isLoser ? '#721c24' : '#856404';
+                const verdict  = isWinner
+                  ? `Treatment is better with ${probPct} probability`
+                  : isLoser
+                    ? `Control is better (treatment win prob = ${probPct})`
+                    : `Inconclusive — treatment win probability ${probPct}`;
+                return (
+                  <div key={t.variantKey} style={{ marginBottom: 20 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 10 }}>
+                      <span className="flag-key">{t.variantKey}</span> vs <span className="flag-key">{results.controlKey}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
+                      {[
+                        ['P(treatment > control)', probPct],
+                        ['Posterior rate — control',   pct(b.posteriorMeanA)],
+                        ['Posterior rate — treatment', pct(b.posteriorMeanB)],
+                        ['Expected lift',   (b.relLift >= 0 ? '+' : '') + (b.relLift * 100).toFixed(2) + '%'],
+                        ['95% credible interval', `[${pp(b.credLo)}, ${pp(b.credHi)}]`],
+                      ].map(([label, val]) => (
+                        <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '10px 16px', minWidth: 130 }}>
+                          <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>{label}</div>
+                          <div style={{ fontFamily: 'monospace', fontWeight: 600 }}>{val}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ display: 'inline-block', padding: '6px 14px', borderRadius: 6, fontWeight: 700, fontSize: 13, background: bgColor, color: txColor }}>
+                      {verdict}
+                    </div>
+                    <div style={{ marginTop: 10, fontSize: 12, color: '#555', maxWidth: 620, lineHeight: 1.5 }}>
+                      The posterior is updated from the observed data. Unlike the p-value, this probability can be read directly:
+                      there is a {probPct} chance treatment converts better than control, given what we observed.
+                    </div>
+                  </div>
+                );
+              })
             }
           </div>
         </>

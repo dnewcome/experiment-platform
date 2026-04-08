@@ -24,6 +24,21 @@ function parseAllocation(row) {
 
 export default async function flagRoutes(app) {
 
+  // ── SDK config endpoint ────────────────────────────────────────────────────
+  // Returns all enabled flags with their variants and allocations in one call.
+  // Designed for SDK polling — callers use this to evaluate flags locally.
+
+  app.get('/sdk/config', async () => {
+    const flags = await db.all("SELECT * FROM flags WHERE enabled = 1 ORDER BY created_at DESC");
+    const result = [];
+    for (const flag of flags) {
+      const variants    = await db.all('SELECT * FROM variants WHERE flag_id = ?', [flag.id]);
+      const allocations = await db.all('SELECT * FROM allocations WHERE flag_id = ? ORDER BY priority ASC', [flag.id]);
+      result.push({ ...parseFlag(flag), variants, allocations: allocations.map(parseAllocation) });
+    }
+    return result;
+  });
+
   // ── Flags ──────────────────────────────────────────────────────────────────
 
   app.get('/flags', async () => {
