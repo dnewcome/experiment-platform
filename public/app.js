@@ -935,6 +935,315 @@ function AssignmentsView() {
 }
 
 // ---------------------------------------------------------------------------
+// Simulation — stats helpers
+// ---------------------------------------------------------------------------
+
+// Abramowitz & Stegun error function approximation (max error < 1.5e-7)
+function erf(x) {
+  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);
+  return sign * y;
+}
+
+function normalCDF(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
+
+// Two-proportion z-test (two-sided). Returns { z, pValue, diff, ci95lo, ci95hi }
+function zTestProportions(n1, x1, n2, x2) {
+  const p1 = x1 / n1, p2 = x2 / n2;
+  const pPool = (x1 + x2) / (n1 + n2);
+  const se    = Math.sqrt(pPool * (1 - pPool) * (1/n1 + 1/n2));
+  const z     = (p1 - p2) / se;
+  const pValue = 2 * (1 - normalCDF(Math.abs(z)));
+  const seDiff = Math.sqrt(p1*(1-p1)/n1 + p2*(1-p2)/n2);
+  return { p1, p2, z, pValue, diff: p1 - p2, ci95lo: (p1-p2) - 1.96*seDiff, ci95hi: (p1-p2) + 1.96*seDiff };
+}
+
+// Achieved power given n per arm, two true rates, alpha=0.05 two-sided
+function computePower(n, p1, p2) {
+  const pBar = (p1 + p2) / 2;
+  const seNull = Math.sqrt(2 * pBar * (1-pBar) / n);
+  const seAlt  = Math.sqrt((p1*(1-p1) + p2*(1-p2)) / n);
+  const zAlpha = 1.96;
+  const zBeta  = (Math.abs(p1-p2) - zAlpha * seNull) / seAlt;
+  return normalCDF(zBeta);
+}
+
+// Sample size per arm for 80% power at alpha=0.05
+function requiredN(p1, p2) {
+  const pBar  = (p1 + p2) / 2;
+  const num   = (1.96 * Math.sqrt(2 * pBar * (1-pBar)) + 0.842 * Math.sqrt(p1*(1-p1) + p2*(1-p2))) ** 2;
+  const denom = (p1 - p2) ** 2;
+  return Math.ceil(num / denom);
+}
+
+// Seeded PRNG (mulberry32) — reproducible runs given same seed
+function makePrng(seed) {
+  let s = seed >>> 0;
+  return function() {
+    s += 0x6D2B79F5;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SimulateView
+// ---------------------------------------------------------------------------
+
+function SimulateView() {
+  const [flags,      setFlags]      = useState([]);
+  const [flagId,     setFlagId]     = useState('');
+  const [flag,       setFlag]       = useState(null);
+  const [nUsers,     setNUsers]     = useState(1000);
+  const [varCfg,     setVarCfg]     = useState({});   // { variantKey: { rate: string } }
+  const [results,    setResults]    = useState(null);
+  const [seed,       setSeed]       = useState(() => Math.floor(Math.random() * 1e9));
+
+  useEffect(() => { api.get('/flags').then(setFlags); }, []);
+
+  async function loadFlag(id) {
+    setFlagId(id);
+    setResults(null);
+    if (!id) { setFlag(null); return; }
+    const f = await api.get(`/flags/${id}`);
+    setFlag(f);
+    // Default rate: 10% for control, 12% for others
+    const cfg = {};
+    f.variants.forEach((v, i) => { cfg[v.key] = { rate: i === 0 ? '0.10' : '0.12' }; });
+    setVarCfg(cfg);
+  }
+
+  function setRate(key, val) {
+    setVarCfg(c => ({ ...c, [key]: { ...c[key], rate: val } }));
+  }
+
+  function runSimulation() {
+    const rng     = makePrng(seed);
+    const variants = flag.variants;
+    // Flatten splits from all allocations into a single bucket map 0-99
+    const alloc = flag.allocations[0];
+    if (!alloc) { alert('No allocation configured on this flag.'); return; }
+    const splits = alloc.splits;
+
+    // Build bucket→variantKey map
+    const bucketMap = new Array(100);
+    let cursor = 0;
+    for (const sp of splits) {
+      for (let b = cursor; b < cursor + sp.weight; b++) bucketMap[b] = sp.variant_key;
+      cursor += sp.weight;
+    }
+
+    // Per-variant accumulators
+    const counts      = {};
+    const conversions = {};
+    variants.forEach(v => { counts[v.key] = 0; conversions[v.key] = 0; });
+
+    for (let i = 0; i < nUsers; i++) {
+      const bucket     = Math.floor(rng() * 100);
+      const variantKey = bucketMap[bucket];
+      if (!variantKey || !counts.hasOwnProperty(variantKey)) continue;
+      counts[variantKey]++;
+      const rate = parseFloat(varCfg[variantKey]?.rate ?? 0);
+      if (rng() < rate) conversions[variantKey]++;
+    }
+
+    // Pick control = first variant
+    const controlKey = variants[0]?.key;
+    const tests = [];
+    for (const v of variants) {
+      if (v.key === controlKey) continue;
+      const n1 = counts[controlKey], x1 = conversions[controlKey];
+      const n2 = counts[v.key],      x2 = conversions[v.key];
+      if (!n1 || !n2) continue;
+      const t   = zTestProportions(n1, x1, n2, x2);
+      const pow = computePower(Math.min(n1, n2), parseFloat(varCfg[controlKey]?.rate ?? 0.1), parseFloat(varCfg[v.key]?.rate ?? 0.1));
+      const req = requiredN(parseFloat(varCfg[controlKey]?.rate ?? 0.1), parseFloat(varCfg[v.key]?.rate ?? 0.1));
+      tests.push({ variantKey: v.key, ...t, power: pow, requiredN: req });
+    }
+
+    setResults({ counts, conversions, tests, controlKey });
+  }
+
+  function pColor(p) { return p < 0.05 ? '#155724' : p < 0.1 ? '#856404' : '#721c24'; }
+  function pBg(p)    { return p < 0.05 ? '#d4edda'  : p < 0.1 ? '#fff3cd' : '#f8d7da'; }
+  function pct(n)    { return (n * 100).toFixed(2) + '%'; }
+  function fmt(n, d=3) { return n.toFixed(d); }
+  function pp(n)     { return (n >= 0 ? '+' : '') + (n*100).toFixed(2) + 'pp'; }
+
+  const hasVariants = flag?.variants?.length > 0;
+  const hasAlloc    = flag?.allocations?.length > 0;
+
+  return (
+    <div>
+      <div className="card">
+        <h2 style={{ marginBottom: 16 }}>Simulate Experiment</h2>
+
+        <div className="form-row" style={{ alignItems: 'flex-end', gap: 16, flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Flag</div>
+            <select className="input" value={flagId} onChange={e => loadFlag(e.target.value)}>
+              <option value="">— select a flag —</option>
+              {flags.map(f => <option key={f.id} value={f.id}>{f.key}</option>)}
+            </select>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Simulated users</div>
+            <input className="input" type="number" min="100" max="1000000" step="100"
+              value={nUsers} onChange={e => setNUsers(Number(e.target.value))} style={{ width: 120 }} />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Random seed</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input className="input" type="number" value={seed}
+                onChange={e => setSeed(Number(e.target.value))} style={{ width: 110 }} />
+              <button className="btn btn-sm" onClick={() => { setSeed(Math.floor(Math.random()*1e9)); setResults(null); }}>↺</button>
+            </div>
+          </div>
+        </div>
+
+        {flag && hasVariants && hasAlloc && (
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 10 }}>
+              Conversion rates per variant
+            </div>
+            <table style={{ width: 'auto' }}>
+              <thead>
+                <tr>
+                  <th>Variant</th>
+                  <th>Split weight</th>
+                  <th>True conversion rate</th>
+                  <th>Role</th>
+                </tr>
+              </thead>
+              <tbody>
+                {flag.variants.map((v, i) => {
+                  const sp = flag.allocations[0]?.splits?.find(s => s.variant_key === v.key);
+                  return (
+                    <tr key={v.key}>
+                      <td><span className="flag-key">{v.key}</span></td>
+                      <td>{sp ? sp.weight + '%' : <span className="muted">—</span>}</td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <input className="input" type="number" min="0" max="1" step="0.001"
+                            value={varCfg[v.key]?.rate ?? '0.10'}
+                            onChange={e => setRate(v.key, e.target.value)}
+                            style={{ width: 90 }} />
+                          <span className="muted">{pct(parseFloat(varCfg[v.key]?.rate ?? 0))}</span>
+                        </div>
+                      </td>
+                      <td style={{ color: '#888', fontSize: 12 }}>{i === 0 ? 'control' : 'treatment'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+
+            <div style={{ marginTop: 16 }}>
+              <button className="btn btn-primary" onClick={runSimulation}>Run Simulation</button>
+            </div>
+          </div>
+        )}
+
+        {flag && !hasVariants && <div className="muted" style={{ marginTop: 12 }}>This flag has no variants. Add variants first.</div>}
+        {flag && !hasAlloc    && <div className="muted" style={{ marginTop: 12 }}>This flag has no allocation. Configure splits first.</div>}
+      </div>
+
+      {results && (
+        <>
+          <div className="card">
+            <h2 style={{ marginBottom: 16 }}>Assignment &amp; Outcome Summary</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>Variant</th>
+                  <th>Role</th>
+                  <th style={{ textAlign: 'right' }}>Users assigned</th>
+                  <th style={{ textAlign: 'right' }}>Conversions</th>
+                  <th style={{ textAlign: 'right' }}>Observed rate</th>
+                  <th style={{ textAlign: 'right' }}>True rate</th>
+                  <th style={{ textAlign: 'right' }}>vs control</th>
+                </tr>
+              </thead>
+              <tbody>
+                {flag.variants.map((v, i) => {
+                  const n    = results.counts[v.key]      ?? 0;
+                  const x    = results.conversions[v.key] ?? 0;
+                  const obs  = n ? x / n : 0;
+                  const ctrl = results.counts[results.controlKey] ? results.conversions[results.controlKey] / results.counts[results.controlKey] : 0;
+                  const diff = i === 0 ? null : obs - ctrl;
+                  return (
+                    <tr key={v.key}>
+                      <td><span className="flag-key">{v.key}</span></td>
+                      <td style={{ color: '#888', fontSize: 12 }}>{i === 0 ? 'control' : 'treatment'}</td>
+                      <td style={{ textAlign: 'right' }}>{n.toLocaleString()}</td>
+                      <td style={{ textAlign: 'right' }}>{x.toLocaleString()}</td>
+                      <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{pct(obs)}</td>
+                      <td style={{ textAlign: 'right', fontFamily: 'monospace', color: '#888' }}>{pct(parseFloat(varCfg[v.key]?.rate ?? 0))}</td>
+                      <td style={{ textAlign: 'right', fontFamily: 'monospace', color: diff === null ? '#ccc' : diff >= 0 ? '#155724' : '#721c24' }}>
+                        {diff === null ? '—' : pp(diff)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="card">
+            <h2 style={{ marginBottom: 4 }}>Statistical Tests</h2>
+            <div className="muted" style={{ marginBottom: 16, fontSize: 12 }}>
+              Two-proportion z-test, two-sided, α = 0.05. Each treatment arm vs. control.
+            </div>
+            {results.tests.length === 0
+              ? <div className="muted">No treatment arms to test.</div>
+              : results.tests.map(t => (
+                <div key={t.variantKey} style={{ marginBottom: 20 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 10 }}>
+                    <span className="flag-key">{t.variantKey}</span> vs <span className="flag-key">{results.controlKey}</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+                    {[
+                      ['z-statistic', fmt(t.z)],
+                      ['p-value',     fmt(t.pValue, 4)],
+                      ['Observed diff', pp(t.diff)],
+                      ['95% CI', `[${pp(t.ci95lo)}, ${pp(t.ci95hi)}]`],
+                      ['Power (this N)', pct(t.power)],
+                      ['N for 80% power', (t.requiredN * 2).toLocaleString() + ' total'],
+                    ].map(([label, val]) => (
+                      <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '10px 16px', minWidth: 140 }}>
+                        <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>{label}</div>
+                        <div style={{ fontFamily: 'monospace', fontWeight: 600 }}>{val}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: 'inline-block', padding: '6px 14px', borderRadius: 6, fontWeight: 700, fontSize: 13, background: pBg(t.pValue), color: pColor(t.pValue) }}>
+                    {t.pValue < 0.05
+                      ? `Statistically significant (p = ${fmt(t.pValue,4)})`
+                      : t.pValue < 0.1
+                        ? `Marginal (p = ${fmt(t.pValue,4)}) — not significant at α=0.05`
+                        : `Not significant (p = ${fmt(t.pValue,4)})`
+                    }
+                  </div>
+                  {t.power < 0.8 && (
+                    <div style={{ marginTop: 8, fontSize: 12, color: '#856404', background: '#fff3cd', padding: '6px 12px', borderRadius: 5, display: 'inline-block' }}>
+                      ⚠ Only {pct(t.power)} power with this sample size. Need {(t.requiredN * 2).toLocaleString()} total users for 80% power.
+                    </div>
+                  )}
+                </div>
+              ))
+            }
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // App root
 // ---------------------------------------------------------------------------
 
@@ -953,6 +1262,7 @@ function App() {
           <button className={view === 'flags' || view === 'flag-detail' ? 'active' : ''} onClick={goToFlags}>Flags</button>
           <button className={view === 'evaluate' ? 'active' : ''} onClick={() => setView('evaluate')}>Evaluate</button>
           <button className={view === 'assignments' ? 'active' : ''} onClick={() => setView('assignments')}>Assignments</button>
+          <button className={view === 'simulate' ? 'active' : ''} onClick={() => setView('simulate')}>Simulate</button>
         </nav>
       </header>
       <main>
@@ -960,6 +1270,7 @@ function App() {
         {view === 'flag-detail' && <FlagDetail flagId={selectedId} onBack={goToFlags} />}
         {view === 'evaluate'    && <EvaluateView />}
         {view === 'assignments' && <AssignmentsView />}
+        {view === 'simulate'    && <SimulateView />}
       </main>
     </div>
   );
