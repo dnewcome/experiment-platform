@@ -63,6 +63,7 @@ async function fetchWithRetry(url, init, maxQueueSize, queue, onError) {
 
 export class ExperimentClient {
   #host;
+  #apiKey;
   #pollingInterval;
   #maxQueueSize;
   #onError;
@@ -74,17 +75,23 @@ export class ExperimentClient {
   /**
    * @param {object}   options
    * @param {string}   options.host              Base URL of the experiment platform server
+   * @param {string}  [options.apiKey]            Bearer token — required if API_KEY is set on the server
    * @param {number}  [options.pollingInterval]   Config refresh interval in ms (default 60 000)
    * @param {number}  [options.maxQueueSize]      Max concurrent in-flight log attempts before
    *                                              events are dropped (default 500)
    * @param {Function}[options.onError]           Called with Error on config fetch or log failures.
    *                                              If omitted, errors are silently swallowed.
    */
-  constructor({ host, pollingInterval = 60_000, maxQueueSize = 500, onError = null }) {
+  constructor({ host, apiKey = null, pollingInterval = 60_000, maxQueueSize = 500, onError = null }) {
     this.#host            = host.replace(/\/$/, '');
+    this.#apiKey          = apiKey;
     this.#pollingInterval = pollingInterval;
     this.#maxQueueSize    = maxQueueSize;
     this.#onError         = onError;
+  }
+
+  get #authHeaders() {
+    return this.#apiKey ? { 'Authorization': `Bearer ${this.#apiKey}` } : {};
   }
 
   /**
@@ -135,7 +142,7 @@ export class ExperimentClient {
       `${this.#host}/api/assignments`,
       {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this.#authHeaders },
         body: JSON.stringify({
           flag_key:      flagKey,
           user_id:       userId,
@@ -146,6 +153,33 @@ export class ExperimentClient {
           allocation_id: result.allocation_id ?? null,
           attributes,
         }),
+      },
+      this.#maxQueueSize,
+      this.#logQueue,
+      this.#onError,
+    );
+  }
+
+  /**
+   * Record a metric event for a user. Fire-and-forget with the same retry
+   * semantics as logAssignment().
+   *
+   * Call this when a user performs a measurable action (conversion, purchase,
+   * click, etc.) after being assigned to a variant. The server joins these
+   * events with experiment_assignments to compute per-variant metric results.
+   *
+   * @param {string} flagKey
+   * @param {string} userId
+   * @param {string} metricName   e.g. 'conversion', 'revenue', 'page_views'
+   * @param {number} [value=1]    1 for binary events; revenue amount for continuous
+   */
+  trackMetricEvent(flagKey, userId, metricName, value = 1) {
+    fetchWithRetry(
+      `${this.#host}/api/metrics/events`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', ...this.#authHeaders },
+        body: JSON.stringify({ flag_key: flagKey, user_id: userId, metric_name: metricName, value }),
       },
       this.#maxQueueSize,
       this.#logQueue,
@@ -191,7 +225,7 @@ export class ExperimentClient {
 
   async #fetchConfig() {
     try {
-      const res = await fetch(`${this.#host}/api/sdk/config`);
+      const res = await fetch(`${this.#host}/api/sdk/config`, { headers: this.#authHeaders });
       if (!res.ok) throw new Error(`Config fetch failed: HTTP ${res.status}`);
       const flags = await res.json();
       const map = new Map();

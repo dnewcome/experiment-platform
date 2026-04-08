@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import flagRoutes from './routes/flags.js';
 import evaluateRoute from './routes/evaluate.js';
+import metricsRoutes from './routes/metrics.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -16,8 +17,21 @@ await app.register(staticPlugin, {
   etag: false,
 });
 
+// Optional API key auth. Set API_KEY env var to require a Bearer token on all
+// /api requests. Leave unset for unauthenticated local development.
+if (process.env.API_KEY) {
+  app.addHook('onRequest', async (req, reply) => {
+    if (!req.url.startsWith('/api')) return;
+    const auth = req.headers['authorization'] ?? '';
+    if (auth !== `Bearer ${process.env.API_KEY}`) {
+      reply.code(401).send({ error: 'Unauthorized' });
+    }
+  });
+}
+
 await app.register(flagRoutes,    { prefix: '/api' });
 await app.register(evaluateRoute, { prefix: '/api' });
+await app.register(metricsRoutes, { prefix: '/api' });
 
 app.setNotFoundHandler((_req, reply) => {
   reply.sendFile('index.html');

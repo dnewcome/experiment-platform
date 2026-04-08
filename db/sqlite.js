@@ -59,6 +59,18 @@ raw.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_assignments_assigned_at
     ON experiment_assignments (assigned_at);
+
+  CREATE TABLE IF NOT EXISTS metric_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    flag_key    TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    value       REAL NOT NULL DEFAULT 1,
+    event_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_metric_events_flag_user
+    ON metric_events (flag_key, user_id, metric_name);
 `);
 
 // ---------------------------------------------------------------------------
@@ -87,6 +99,29 @@ if (version < 1) {
     }
 
     raw.pragma(`user_version = 1`);
+    raw.exec(`COMMIT`);
+  } catch (e) {
+    raw.exec(`ROLLBACK`);
+    throw e;
+  }
+}
+
+if (version < 3) {
+  raw.exec(`BEGIN`);
+  try {
+    raw.exec(`
+      CREATE TABLE IF NOT EXISTS metric_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        flag_key    TEXT NOT NULL,
+        user_id     TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        value       REAL NOT NULL DEFAULT 1,
+        event_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_metric_events_flag_user
+        ON metric_events (flag_key, user_id, metric_name);
+    `);
+    raw.pragma(`user_version = 3`);
     raw.exec(`COMMIT`);
   } catch (e) {
     raw.exec(`ROLLBACK`);

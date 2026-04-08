@@ -1,15 +1,78 @@
 const { useState, useEffect, useMemo } = React;
 
 // ---------------------------------------------------------------------------
+// API key auth helpers
+// ---------------------------------------------------------------------------
+
+const AUTH_KEY = 'experiment_api_key';
+const getApiKey  = () => localStorage.getItem(AUTH_KEY) ?? '';
+const setApiKey  = (k) => k ? localStorage.setItem(AUTH_KEY, k) : localStorage.removeItem(AUTH_KEY);
+
+// Global 401 handler — components subscribe via this callback
+let _on401 = null;
+const on401 = (cb) => { _on401 = cb; };
+
+// ---------------------------------------------------------------------------
 // API helpers
 // ---------------------------------------------------------------------------
 
+async function apiFetch(path, init = {}) {
+  const key = getApiKey();
+  const headers = { ...init.headers };
+  if (key) headers['Authorization'] = `Bearer ${key}`;
+  const res = await fetch(`/api${path}`, { ...init, headers });
+  if (res.status === 401) { _on401?.(); return { error: 'Unauthorized' }; }
+  return res.json();
+}
+
 const api = {
-  get:  (path)       => fetch(`/api${path}`).then(r => r.json()),
-  post: (path, body) => fetch(`/api${path}`, { method: 'POST',   headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json()),
-  put:  (path, body) => fetch(`/api${path}`, { method: 'PUT',    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json()),
-  del:  (path)       => fetch(`/api${path}`, { method: 'DELETE' }).then(r => r.json()),
+  get:  (path)       => apiFetch(path),
+  post: (path, body) => apiFetch(path, { method: 'POST',   headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  put:  (path, body) => apiFetch(path, { method: 'PUT',    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  del:  (path)       => apiFetch(path, { method: 'DELETE' }),
 };
+
+// ---------------------------------------------------------------------------
+// ApiKeyGate — wraps the whole app; shows a login form when a key is required
+// ---------------------------------------------------------------------------
+
+function ApiKeyGate({ children }) {
+  const [locked, setLocked] = useState(false);
+  const [input,  setInput]  = useState('');
+  const [error,  setError]  = useState('');
+
+  useEffect(() => {
+    on401(() => setLocked(true));
+    // Probe on mount so we detect a key requirement immediately
+    apiFetch('/flags').then(r => { if (r.error === 'Unauthorized') setLocked(true); });
+  }, []);
+
+  async function submit() {
+    setError('');
+    setApiKey(input.trim());
+    const probe = await apiFetch('/flags');
+    if (probe.error === 'Unauthorized') { setError('Invalid key'); setApiKey(''); }
+    else setLocked(false);
+  }
+
+  if (!locked) return children;
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: '#f5f5f5' }}>
+      <div className="card" style={{ width: 360, margin: 0 }}>
+        <h2 style={{ marginBottom: 4 }}>API Key Required</h2>
+        <p className="muted" style={{ marginBottom: 16, fontSize: 13 }}>
+          This server requires an API key. Enter the value of the <code>API_KEY</code> environment variable.
+        </p>
+        <input className="input" style={{ width: '100%', marginBottom: 8 }} type="password"
+          placeholder="Bearer token" value={input} onChange={e => setInput(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && submit()} autoFocus />
+        {error && <div className="error" style={{ marginBottom: 8 }}>{error}</div>}
+        <button className="btn btn-primary" style={{ width: '100%' }} onClick={submit}>Unlock</button>
+      </div>
+    </div>
+  );
+}
 
 // Ensure an allocation received from the API always has splits as an array
 // and targeting_rules as an object/null — guards against the server sending
@@ -462,6 +525,202 @@ function AllocationModal({ flag, editAlloc, onSave, onClose }) {
 // Flag Detail
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Results — live metric analysis from real assignment + metric event data
+// ---------------------------------------------------------------------------
+
+function ResultsCard({ flag }) {
+  const [metricNames,  setMetricNames]  = useState([]);
+  const [metric,       setMetric]       = useState('');
+  const [results,      setResults]      = useState(null);
+  const [loading,      setLoading]      = useState(false);
+  const [importText,   setImportText]   = useState('');
+  const [importStatus, setImportStatus] = useState('');
+  const [showImport,   setShowImport]   = useState(false);
+
+  useEffect(() => {
+    api.get(`/metrics/names?flag_key=${flag.key}`).then(r => {
+      if (Array.isArray(r)) {
+        setMetricNames(r);
+        if (r.length > 0 && !metric) setMetric(r[0].metric_name);
+      }
+    });
+  }, [flag.key]);
+
+  async function loadResults() {
+    if (!metric) return;
+    setLoading(true);
+    const r = await api.get(`/metrics/results/${flag.key}?metric=${encodeURIComponent(metric)}`);
+    setLoading(false);
+    if (r.error) { alert(r.error); return; }
+    setResults(r);
+  }
+
+  async function importCsv() {
+    setImportStatus('');
+    const lines = importText.trim().split('\n').filter(Boolean);
+    if (!lines.length) return;
+    // Expected format: user_id,value  (header optional)
+    const events = [];
+    for (const line of lines) {
+      const parts = line.split(',');
+      if (parts.length < 1) continue;
+      const uid = parts[0].trim();
+      if (uid === 'user_id' || uid === 'user') continue; // skip header
+      const val = parts[1] ? parseFloat(parts[1].trim()) : 1;
+      if (uid) events.push({ user_id: uid, value: isNaN(val) ? 1 : val });
+    }
+    if (!events.length) { setImportStatus('No valid rows found.'); return; }
+    const res = await api.post('/metrics/events/bulk', { flag_key: flag.key, metric_name: metric || 'conversion', events });
+    if (res.error) { setImportStatus(`Error: ${res.error}`); return; }
+    setImportStatus(`Imported ${res.inserted} events.`);
+    setImportText('');
+    setShowImport(false);
+    api.get(`/metrics/names?flag_key=${flag.key}`).then(r => { if (Array.isArray(r)) setMetricNames(r); });
+  }
+
+  // Reuse stats functions defined earlier in the file
+  function analyze() {
+    if (!results || results.variants.length < 2) return null;
+    const ctrl = results.variants[0];
+    return results.variants.slice(1).map(trt => {
+      if (!ctrl.assigned || !trt.assigned) return null;
+      const freq = zTestProportions(ctrl.assigned, ctrl.converted, trt.assigned, trt.converted);
+      const bay  = bayesianTest(ctrl.assigned, ctrl.converted, trt.assigned, trt.converted);
+      const sp1  = flag.allocations[0]?.splits?.find(s => s.variant_key === ctrl.variant);
+      const sp2  = flag.allocations[0]?.splits?.find(s => s.variant_key === trt.variant);
+      const w1   = (sp1?.weight ?? 50) / 100, w2 = (sp2?.weight ?? 50) / 100;
+      const pow  = computePower(ctrl.assigned, trt.assigned, ctrl.rate, trt.rate);
+      const req  = requiredNTotal(ctrl.rate, trt.rate, w1, w2);
+      return { trt, freq, bay, pow, req, w1, w2 };
+    }).filter(Boolean);
+  }
+
+  const analyses = analyze();
+  const pct  = n  => (n * 100).toFixed(2) + '%';
+  const pp   = n  => (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + 'pp';
+  const fmt  = (n, d=3) => n.toFixed(d);
+
+  return (
+    <div className="card">
+      <div className="section-header" style={{ marginBottom: 12 }}>
+        <div className="section-label">Experiment Results</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button className="btn btn-sm" onClick={() => setShowImport(s => !s)}>
+            {showImport ? 'Cancel' : '↑ Import CSV'}
+          </button>
+        </div>
+      </div>
+
+      {showImport && (
+        <div style={{ marginBottom: 16, padding: '12px', background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6 }}>
+          <div style={{ fontSize: 12, color: '#555', marginBottom: 6 }}>
+            Paste CSV: <code>user_id,value</code> (value defaults to 1 for binary conversion).
+            Metric name: <input className="input" style={{ width: 160, marginLeft: 6 }} placeholder="e.g. conversion"
+              value={metric} onChange={e => setMetric(e.target.value)} />
+          </div>
+          <textarea className="input" style={{ width: '100%', height: 100, fontFamily: 'monospace', fontSize: 12, resize: 'vertical' }}
+            placeholder={"user-123,1\nuser-456,1\nuser-789,0"} value={importText}
+            onChange={e => setImportText(e.target.value)} />
+          <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button className="btn btn-sm btn-primary" onClick={importCsv}>Import</button>
+            {importStatus && <span className="muted" style={{ fontSize: 12 }}>{importStatus}</span>}
+          </div>
+        </div>
+      )}
+
+      <div className="form-row" style={{ marginBottom: 12 }}>
+        <div>
+          <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Metric</div>
+          {metricNames.length > 0
+            ? <select className="input" value={metric} onChange={e => setMetric(e.target.value)}>
+                {metricNames.map(m => <option key={m.metric_name} value={m.metric_name}>{m.metric_name} ({m.event_count} events)</option>)}
+              </select>
+            : <input className="input" placeholder="metric name" value={metric} onChange={e => setMetric(e.target.value)} style={{ width: 200 }} />
+          }
+        </div>
+        <div style={{ alignSelf: 'flex-end' }}>
+          <button className="btn btn-primary" onClick={loadResults} disabled={!metric || loading}>
+            {loading ? 'Loading…' : 'Analyze'}
+          </button>
+        </div>
+      </div>
+
+      {metricNames.length === 0 && (
+        <div className="muted" style={{ fontSize: 12, marginBottom: 12 }}>
+          No metric events yet. Import a CSV above, call <code>POST /api/metrics/events/bulk</code> from your dbt pipeline,
+          or use <code>client.trackMetricEvent()</code> from the SDK.
+        </div>
+      )}
+
+      {results && (
+        <>
+          <table style={{ marginBottom: 16 }}>
+            <thead>
+              <tr>
+                <th>Variant</th>
+                <th style={{ textAlign: 'right' }}>Assigned</th>
+                <th style={{ textAlign: 'right' }}>Converted</th>
+                <th style={{ textAlign: 'right' }}>Rate</th>
+                <th style={{ textAlign: 'right' }}>vs control</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.variants.map((v, i) => {
+                const ctrl = results.variants[0];
+                const diff = i === 0 ? null : v.rate - ctrl.rate;
+                return (
+                  <tr key={v.variant}>
+                    <td><span className="flag-key">{v.variant}</span> {i === 0 && <span className="muted" style={{ fontSize: 11 }}>control</span>}</td>
+                    <td style={{ textAlign: 'right' }}>{v.assigned.toLocaleString()}</td>
+                    <td style={{ textAlign: 'right' }}>{v.converted.toLocaleString()}</td>
+                    <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{pct(v.rate)}</td>
+                    <td style={{ textAlign: 'right', fontFamily: 'monospace', color: diff === null ? '#ccc' : diff > 0 ? '#155724' : '#721c24' }}>
+                      {diff === null ? '—' : pp(diff)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {analyses && analyses.map(a => {
+            const { bg, tx } = verdictStyle(a.freq.pValue, a.pow);
+            return (
+              <div key={a.trt.variant} style={{ marginBottom: 16 }}>
+                <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 13 }}>
+                  <span className="flag-key">{a.trt.variant}</span> vs <span className="flag-key">{results.variants[0].variant}</span>
+                </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
+                  {[
+                    ['p-value',              fmt(a.freq.pValue, 4)],
+                    ['95% CI',               `[${pp(a.freq.ci95lo)}, ${pp(a.freq.ci95hi)}]`],
+                    ['P(treatment > ctrl)',   pct(a.bay.probBgtA)],
+                    ['Expected lift',         (a.bay.relLift >= 0 ? '+' : '') + (a.bay.relLift * 100).toFixed(2) + '%'],
+                    ['Power',                 pct(a.pow)],
+                    ['N for 80% power',       a.req.toLocaleString() + ` total`],
+                  ].map(([label, val]) => (
+                    <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '8px 14px', minWidth: 120 }}>
+                      <div style={{ fontSize: 11, color: '#888', marginBottom: 3 }}>{label}</div>
+                      <div style={{ fontFamily: 'monospace', fontWeight: 600, fontSize: 13 }}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 6, fontWeight: 700, fontSize: 12, background: bg, color: tx }}>
+                  {a.freq.pValue < 0.05
+                    ? a.pow < 0.6 ? `Significant but underpowered — effect may be inflated` : `Statistically significant (p = ${fmt(a.freq.pValue,4)})`
+                    : a.freq.pValue < 0.1 ? `Marginal (p = ${fmt(a.freq.pValue,4)})` : `Not significant (p = ${fmt(a.freq.pValue,4)})`
+                  }
+                </div>
+              </div>
+            );
+          })}
+        </>
+      )}
+    </div>
+  );
+}
+
 function SrmWidget({ flagKey, startedAt }) {
   const [srm, setSrm] = useState(null);
 
@@ -601,9 +860,12 @@ function FlagDetail({ flagId, onBack }) {
         {flag.description && <div style={{ marginTop: 6, color: '#555' }}>{flag.description}</div>}
       </div>
 
-      {/* SRM widget — shown when experiment has run */}
+      {/* Results + SRM — shown when experiment has run */}
       {(flag.status === 'running' || flag.status === 'stopped') && (
-        <SrmWidget flagKey={flag.key} startedAt={flag.started_at} />
+        <>
+          <ResultsCard flag={flag} />
+          <SrmWidget flagKey={flag.key} startedAt={flag.started_at} />
+        </>
       )}
 
       {/* Experiment lifecycle bar */}
@@ -1469,4 +1731,6 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <ApiKeyGate><App /></ApiKeyGate>
+);
