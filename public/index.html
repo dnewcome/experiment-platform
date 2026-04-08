@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Experiment Platform</title>
+  <!-- UMD builds — single React instance, no module graph conflicts -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel standalone transforms JSX in app.js without a build step -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      background: #f5f5f5;
+      color: #1a1a1a;
+    }
+
+    header {
+      background: #1a1a2e;
+      color: #fff;
+      padding: 0 24px;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: 0.5px; }
+    header nav { display: flex; gap: 4px; margin-left: auto; }
+    header nav button {
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.2);
+      color: #fff;
+      padding: 5px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    header nav button:hover { background: rgba(255,255,255,0.1); }
+    header nav button.active { background: rgba(255,255,255,0.2); border-color: rgba(255,255,255,0.5); }
+
+    main { max-width: 960px; margin: 0 auto; padding: 24px; }
+
+    .card {
+      background: #fff;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card h2 { margin: 0 0 16px; font-size: 15px; }
+
+    .section { margin-bottom: 20px; }
+    .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .section-label { font-size: 12px; font-weight: 600; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    .flag-row {
+      display: flex;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid #f0f0f0;
+      gap: 12px;
+    }
+    .flag-row:last-child { border-bottom: none; }
+    .flag-key { font-family: monospace; font-size: 13px; background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+    .flag-name { flex: 1; }
+
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-on  { background: #d4edda; color: #155724; }
+    .badge-off { background: #f8d7da; color: #721c24; }
+
+    button.btn {
+      padding: 6px 14px; border-radius: 5px; border: 1px solid #ddd;
+      cursor: pointer; font-size: 13px; background: #fff;
+    }
+    button.btn:hover { background: #f5f5f5; }
+    button.btn:disabled { opacity: 0.4; cursor: default; }
+    button.btn-primary { background: #1a1a2e; color: #fff; border-color: #1a1a2e; }
+    button.btn-primary:hover { background: #2d2d4e; }
+    button.btn-danger { background: #fff; color: #c0392b; border-color: #e0b0b0; }
+    button.btn-danger:hover { background: #fff5f5; }
+    button.btn-sm { padding: 3px 10px; font-size: 12px; }
+    button.btn-xs { padding: 2px 7px; font-size: 11px; }
+
+    .form-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }
+    input.input, select.input, textarea.input {
+      padding: 7px 10px; border: 1px solid #ddd; border-radius: 5px;
+      font-size: 13px; outline: none; font-family: inherit;
+    }
+    input.input:focus, select.input:focus, textarea.input:focus { border-color: #1a1a2e; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 8px 10px; border-bottom: 2px solid #e5e5e5; color: #555; font-weight: 600; font-size: 12px; }
+    td { padding: 8px 10px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+
+    .back-link { color: #1a1a2e; cursor: pointer; font-size: 13px; margin-bottom: 16px; display: inline-block; }
+    .back-link:hover { text-decoration: underline; }
+
+    .toggle { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider { position: absolute; inset: 0; background: #ccc; border-radius: 20px; cursor: pointer; transition: 0.2s; }
+    .toggle-slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: white; border-radius: 50%; transition: 0.2s; }
+    .toggle input:checked + .toggle-slider { background: #27ae60; }
+    .toggle input:checked + .toggle-slider::before { transform: translateX(16px); }
+
+    .result-box {
+      font-family: monospace; font-size: 13px; background: #1a1a2e;
+      color: #a8ff78; padding: 16px; border-radius: 6px; white-space: pre;
+    }
+
+    .error   { color: #c0392b; font-size: 12px; margin-top: 4px; }
+    .muted   { color: #999; font-size: 13px; }
+    .empty-state { text-align: center; padding: 32px; color: #999; }
+
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+      display: flex; align-items: flex-start; justify-content: center;
+      z-index: 100; overflow-y: auto; padding: 40px 20px;
+    }
+    .modal {
+      background: #fff; border-radius: 8px; padding: 24px;
+      width: 720px; max-width: 95vw;
+    }
+    .modal h2 { margin: 0 0 20px; font-size: 16px; }
+    .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+
+    /* Rule builder */
+    .rule-group {
+      border: 1px solid #d0d8e8; border-radius: 6px;
+      padding: 12px; background: #f8f9fc; margin-bottom: 8px;
+    }
+    .rule-group-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+    .rule-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+    .rule-row select, .rule-row input { font-size: 12px; padding: 4px 7px; border: 1px solid #ccc; border-radius: 4px; outline: none; }
+    .rule-row select:focus, .rule-row input:focus { border-color: #1a1a2e; }
+    .combinator-badge {
+      font-size: 11px; font-weight: 700; padding: 2px 8px;
+      border-radius: 10px; cursor: pointer; user-select: none;
+    }
+    .combinator-and { background: #dbeafe; color: #1e40af; }
+    .combinator-or  { background: #fce7f3; color: #9d174d; }
+  </style>
+</head>
+<body>
+  <div id="root"><p style="padding:20px;color:#888">Loading…</p></div>
+  <script type="text/babel" src="/app.js?v=3"></script>
+</body>
+</html>

@@ -1,0 +1,917 @@
+const { useState, useEffect, useMemo } = React;
+
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
+
+const api = {
+  get:  (path)       => fetch(`/api${path}`).then(r => r.json()),
+  post: (path, body) => fetch(`/api${path}`, { method: 'POST',   headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json()),
+  put:  (path, body) => fetch(`/api${path}`, { method: 'PUT',    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json()),
+  del:  (path)       => fetch(`/api${path}`, { method: 'DELETE' }).then(r => r.json()),
+};
+
+// ---------------------------------------------------------------------------
+// Rule Builder — outputs JSON Logic
+// ---------------------------------------------------------------------------
+
+const OPERATORS_TEXT   = ['==', '!=', 'contains', 'not_contains', 'starts_with', 'in'];
+const OPERATORS_NUMBER = ['==', '!=', '>', '>=', '<', '<='];
+
+function getOperators(field) {
+  return field?.inputType === 'number' ? OPERATORS_NUMBER : OPERATORS_TEXT;
+}
+
+function uid() { return Math.random().toString(36).slice(2); }
+
+function defaultRule(fields) {
+  const f = fields[0] ?? { name: 'user_id', inputType: 'text' };
+  return { id: uid(), field: f.name, operator: '==', value: '' };
+}
+
+function defaultGroup(fields) {
+  return { id: uid(), combinator: 'and', rules: [defaultRule(fields)] };
+}
+
+function ruleToJsonLogic(rule, fields) {
+  if (rule.rules) return groupToJsonLogic(rule, fields);
+  const v = { var: rule.field };
+  const fieldDef = fields.find(f => f.name === rule.field);
+  const isNumber = fieldDef?.inputType === 'number';
+  const val = isNumber ? Number(rule.value) : rule.value;
+  switch (rule.operator) {
+    case '==':           return { '==':  [v, val] };
+    case '!=':           return { '!=':  [v, val] };
+    case '>':            return { '>':   [v, val] };
+    case '>=':           return { '>=':  [v, val] };
+    case '<':            return { '<':   [v, val] };
+    case '<=':           return { '<=':  [v, val] };
+    case 'contains':     return { 'in':  [val, v] };
+    case 'not_contains': return { '!':   [{ 'in': [val, v] }] };
+    case 'starts_with':  return { '===': [{ substr: [v, 0, String(val).length] }, val] };
+    case 'in':           return { 'in':  [v, String(val).split(',').map(s => s.trim())] };
+    default:             return { '==':  [v, val] };
+  }
+}
+
+function groupToJsonLogic(group, fields) {
+  const conditions = group.rules.map(r => ruleToJsonLogic(r, fields));
+  return { [group.combinator]: conditions };
+}
+
+function extractQuery(targeting_rules) {
+  return targeting_rules?._builderQuery ?? null;
+}
+
+function RuleCondition({ rule, fields, onChange, onRemove }) {
+  const fieldDef  = fields.find(f => f.name === rule.field) ?? fields[0];
+  const operators = getOperators(fieldDef);
+
+  function update(patch) {
+    const updated = { ...rule, ...patch };
+    if (patch.field) {
+      const ops = getOperators(fields.find(f => f.name === patch.field));
+      if (!ops.includes(updated.operator)) updated.operator = ops[0];
+    }
+    onChange(updated);
+  }
+
+  return (
+    <div className="rule-row">
+      <select value={rule.field} onChange={e => update({ field: e.target.value })}>
+        {fields.map(f => <option key={f.name} value={f.name}>{f.label}</option>)}
+      </select>
+      <select value={rule.operator} onChange={e => update({ operator: e.target.value })}>
+        {operators.map(op => <option key={op} value={op}>{op}</option>)}
+      </select>
+      <input
+        value={rule.value}
+        onChange={e => update({ value: e.target.value })}
+        placeholder={rule.operator === 'in' ? 'a, b, c' : 'value'}
+        style={{ width: 140 }}
+      />
+      <button className="btn btn-xs btn-danger" onClick={onRemove}>×</button>
+    </div>
+  );
+}
+
+function RuleGroup({ group, fields, onChange, onRemove, depth = 0 }) {
+  function toggleCombinator() {
+    onChange({ ...group, combinator: group.combinator === 'and' ? 'or' : 'and' });
+  }
+  function updateRule(i, updated) {
+    onChange({ ...group, rules: group.rules.map((r, j) => j === i ? updated : r) });
+  }
+  function removeRule(i) {
+    onChange({ ...group, rules: group.rules.filter((_, j) => j !== i) });
+  }
+  function addCondition() {
+    onChange({ ...group, rules: [...group.rules, defaultRule(fields)] });
+  }
+  function addGroup() {
+    onChange({ ...group, rules: [...group.rules, defaultGroup(fields)] });
+  }
+
+  return (
+    <div className="rule-group" style={depth > 0 ? { marginTop: 8 } : {}}>
+      <div className="rule-group-header">
+        <span
+          className={`combinator-badge combinator-${group.combinator}`}
+          onClick={toggleCombinator}
+          title="Click to toggle AND / OR"
+        >
+          {group.combinator.toUpperCase()}
+        </span>
+        <span style={{ fontSize: 11, color: '#888' }}>click to toggle</span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          <button className="btn btn-xs" onClick={addCondition}>+ Condition</button>
+          {depth < 2 && <button className="btn btn-xs" onClick={addGroup}>+ Group</button>}
+          {onRemove && <button className="btn btn-xs btn-danger" onClick={onRemove}>Remove Group</button>}
+        </div>
+      </div>
+      {group.rules.map((rule, i) => (
+        rule.rules
+          ? <RuleGroup key={rule.id} group={rule} fields={fields} depth={depth + 1}
+              onChange={u => updateRule(i, u)} onRemove={() => removeRule(i)} />
+          : <RuleCondition key={rule.id} rule={rule} fields={fields}
+              onChange={u => updateRule(i, u)} onRemove={() => removeRule(i)} />
+      ))}
+      {group.rules.length === 0 && (
+        <div className="muted" style={{ fontSize: 12, padding: '4px 0' }}>No conditions yet.</div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SplitEditor — variant weights that must sum to 100
+// ---------------------------------------------------------------------------
+
+function SplitEditor({ variants, splits, onChange }) {
+  const total = splits.reduce((s, x) => s + x.weight, 0);
+  const ok    = total === 100;
+
+  function setWeight(variantKey, raw) {
+    const weight = Math.max(0, Math.min(100, Number(raw) || 0));
+    const next   = splits.map(s => s.variant_key === variantKey ? { ...s, weight } : s);
+    onChange(next);
+  }
+
+  // Ensure splits has an entry for every variant
+  const normalised = variants.map(v => {
+    const existing = splits.find(s => s.variant_key === v.key);
+    return existing ?? { variant_key: v.key, weight: 0 };
+  });
+
+  if (normalised.length !== splits.length) {
+    // sync on next render
+    setTimeout(() => onChange(normalised), 0);
+  }
+
+  return (
+    <div>
+      {normalised.map(s => {
+        const barPct = Math.round((s.weight / 100) * 100);
+        return (
+          <div key={s.variant_key} style={{ marginBottom: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+              <span className="flag-key" style={{ minWidth: 100 }}>{s.variant_key}</span>
+              <input
+                type="number" min="0" max="100"
+                value={s.weight}
+                onChange={e => setWeight(s.variant_key, e.target.value)}
+                style={{ width: 64, padding: '4px 8px', border: '1px solid #ddd', borderRadius: 4, fontSize: 13 }}
+              />
+              <span className="muted">%</span>
+            </div>
+            <div style={{ height: 6, background: '#e5e5e5', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${barPct}%`, background: '#1a1a2e', borderRadius: 3, transition: 'width 0.2s' }} />
+            </div>
+          </div>
+        );
+      })}
+      <div style={{ marginTop: 8, fontWeight: 600, fontSize: 13, color: ok ? '#27ae60' : '#c0392b' }}>
+        Total: {total} / 100 {ok ? '✓' : `— need ${100 - total > 0 ? '+' : ''}${100 - total} more`}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Shared Toggle
+// ---------------------------------------------------------------------------
+
+function Toggle({ checked, onChange }) {
+  return (
+    <label className="toggle">
+      <input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)} />
+      <span className="toggle-slider"></span>
+    </label>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Flag type badge
+// ---------------------------------------------------------------------------
+
+function TypeBadge({ type }) {
+  const colors = { boolean: '#dbeafe:#1e40af', string: '#dcfce7:#166534', json: '#fef9c3:#713f12' };
+  const [bg, fg] = (colors[type] ?? '#f3f4f6:#374151').split(':');
+  return (
+    <span style={{ background: bg, color: fg, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600 }}>
+      {type}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Variant value input — respects flag type
+// ---------------------------------------------------------------------------
+
+function VariantValueInput({ type, value, onChange }) {
+  if (type === 'boolean') {
+    return (
+      <select className="input" value={value} onChange={e => onChange(e.target.value)}>
+        <option value="">— choose —</option>
+        <option value="true">true</option>
+        <option value="false">false</option>
+      </select>
+    );
+  }
+  if (type === 'json') {
+    return (
+      <textarea
+        className="input"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={'{"key": "value"}'}
+        style={{ width: 240, height: 60, resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
+      />
+    );
+  }
+  return (
+    <input className="input" value={value} onChange={e => onChange(e.target.value)} placeholder="string value" />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Flag List
+// ---------------------------------------------------------------------------
+
+function FlagList({ onSelectFlag }) {
+  const [flags, setFlags]       = useState([]);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm]         = useState({ key: '', name: '', description: '', type: 'boolean' });
+  const [error, setError]       = useState('');
+
+  useEffect(() => { api.get('/flags').then(setFlags); }, []);
+
+  async function createFlag() {
+    setError('');
+    const res = await api.post('/flags', form);
+    if (res.error) { setError(res.error); return; }
+    setFlags(f => [res, ...f]);
+    setForm({ key: '', name: '', description: '', type: 'boolean' });
+    setShowForm(false);
+  }
+
+  async function toggleFlag(flag) {
+    const res = await api.put(`/flags/${flag.id}`, { enabled: !flag.enabled });
+    setFlags(f => f.map(x => x.id === flag.id ? res : x));
+  }
+
+  async function deleteFlag(flag) {
+    if (!confirm(`Delete flag "${flag.key}"?`)) return;
+    await api.del(`/flags/${flag.id}`);
+    setFlags(f => f.filter(x => x.id !== flag.id));
+  }
+
+  return (
+    <div>
+      <div className="section-header">
+        <h2 style={{ margin: 0 }}>Feature Flags</h2>
+        <button className="btn btn-primary" onClick={() => setShowForm(s => !s)}>
+          {showForm ? 'Cancel' : '+ New Flag'}
+        </button>
+      </div>
+
+      {showForm && (
+        <div className="card">
+          <div className="section-label" style={{ marginBottom: 12 }}>Create Flag</div>
+          <div className="form-row">
+            <input className="input" placeholder="flag-key" value={form.key}
+              onInput={e => setForm(f => ({ ...f, key: e.target.value }))} />
+            <input className="input" placeholder="Display name" value={form.name}
+              onInput={e => setForm(f => ({ ...f, name: e.target.value }))} />
+            <select className="input" value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value }))}>
+              <option value="boolean">boolean</option>
+              <option value="string">string</option>
+              <option value="json">json</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <input className="input" style={{ width: '100%' }} placeholder="Description (optional)" value={form.description}
+              onInput={e => setForm(f => ({ ...f, description: e.target.value }))} />
+          </div>
+          {error && <div className="error">{error}</div>}
+          <div style={{ marginTop: 12 }}>
+            <button className="btn btn-primary" onClick={createFlag}>Create</button>
+          </div>
+        </div>
+      )}
+
+      <div className="card">
+        {flags.length === 0
+          ? <div className="empty-state">No flags yet. Create one to get started.</div>
+          : flags.map(flag => (
+            <div key={flag.id} className="flag-row">
+              <Toggle checked={flag.enabled} onChange={() => toggleFlag(flag)} />
+              <TypeBadge type={flag.type} />
+              <span className="flag-key">{flag.key}</span>
+              <span className="flag-name">{flag.name}</span>
+              <span className={`badge badge-${flag.enabled ? 'on' : 'off'}`}>
+                {flag.enabled ? 'ON' : 'OFF'}
+              </span>
+              <button className="btn btn-sm" onClick={() => onSelectFlag(flag.id)}>Edit →</button>
+              <button className="btn btn-sm btn-danger" onClick={() => deleteFlag(flag)}>Delete</button>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Allocation Modal
+// ---------------------------------------------------------------------------
+
+function AllocationModal({ flag, editAlloc, onSave, onClose }) {
+  const initSplits = editAlloc?.splits ?? flag.variants.map(v => ({ variant_key: v.key, weight: 0 }));
+  const [splits,   setSplits]   = useState(initSplits);
+  const [priority, setPriority] = useState(editAlloc?.priority ?? 0);
+  const [catchAll, setCatchAll] = useState(!editAlloc?.targeting_rules);
+  const [query,    setQuery]    = useState(extractQuery(editAlloc?.targeting_rules) ?? defaultGroup(flag.fields));
+
+  const fields = flag.fields.length > 0 ? flag.fields : [{ name: 'user_id', label: 'User ID', inputType: 'text' }];
+  const total  = splits.reduce((s, x) => s + x.weight, 0);
+
+  async function save() {
+    if (total !== 100) { alert(`Weights must sum to 100 (currently ${total})`); return; }
+    let targeting_rules = null;
+    if (!catchAll && query.rules.length > 0) {
+      const jsonLogic = groupToJsonLogic(query, fields);
+      targeting_rules = { ...jsonLogic, _builderQuery: query };
+    }
+    const res = await onSave({ splits, targeting_rules, priority: Number(priority) });
+    if (res?.error) { alert(res.error); return; }
+    onClose();
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <h2>{editAlloc ? 'Edit Allocation' : 'New Allocation'}</h2>
+
+        <div className="section">
+          <div className="section-label" style={{ marginBottom: 10 }}>Traffic Split</div>
+          <div className="muted" style={{ marginBottom: 12 }}>
+            Weights must add up to 100. Users matched by targeting rules are split across variants by these weights.
+          </div>
+          {flag.variants.length === 0
+            ? <div className="error">Add variants to the flag before creating an allocation.</div>
+            : <SplitEditor variants={flag.variants} splits={splits} onChange={setSplits} />
+          }
+        </div>
+
+        <div className="section">
+          <div className="section-label" style={{ marginBottom: 8 }}>Targeting Rules</div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, cursor: 'pointer' }}>
+            <input type="checkbox" checked={catchAll} onChange={e => setCatchAll(e.target.checked)} />
+            Catch-all — match every user
+          </label>
+          {!catchAll && (
+            <RuleGroup group={query} fields={fields} onChange={setQuery} />
+          )}
+        </div>
+
+        <div className="section">
+          <div className="section-label" style={{ marginBottom: 8 }}>Priority</div>
+          <input type="number" className="input" value={priority} min="0"
+            onInput={e => setPriority(e.target.value)} style={{ width: 90 }} />
+          <div className="muted" style={{ marginTop: 4 }}>Lower = evaluated first.</div>
+        </div>
+
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={save} disabled={total !== 100}>
+            Save Allocation
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Flag Detail
+// ---------------------------------------------------------------------------
+
+function FlagDetail({ flagId, onBack }) {
+  const [flag,           setFlag]           = useState(null);
+  const [variantForm,    setVariantForm]    = useState({ key: '', value: '' });
+  const [showAllocModal, setShowAllocModal] = useState(false);
+  const [editAlloc,      setEditAlloc]      = useState(null);
+  const [fieldForm,      setFieldForm]      = useState({ name: '', label: '', inputType: 'text' });
+  const [showFieldForm,  setShowFieldForm]  = useState(false);
+
+  useEffect(() => { api.get(`/flags/${flagId}`).then(setFlag); }, [flagId]);
+
+  async function toggleEnabled() {
+    const res = await api.put(`/flags/${flagId}`, { enabled: !flag.enabled });
+    setFlag(f => ({ ...f, enabled: res.enabled }));
+  }
+
+  async function addVariant() {
+    if (!variantForm.key || !variantForm.value) return;
+    const res = await api.post(`/flags/${flagId}/variants`, variantForm);
+    if (res.error) { alert(res.error); return; }
+    setFlag(f => ({ ...f, variants: [...f.variants, res] }));
+    setVariantForm({ key: '', value: '' });
+  }
+
+  async function deleteVariant(v) {
+    if (!confirm(`Delete variant "${v.key}"?`)) return;
+    await api.del(`/flags/${flagId}/variants/${v.id}`);
+    setFlag(f => ({ ...f, variants: f.variants.filter(x => x.id !== v.id) }));
+  }
+
+  async function saveAllocation(data) {
+    let res;
+    if (editAlloc) {
+      res = await api.put(`/flags/${flagId}/allocations/${editAlloc.id}`, data);
+      if (res.error) return res;
+      setFlag(f => ({ ...f, allocations: f.allocations.map(a => a.id === editAlloc.id ? res : a) }));
+    } else {
+      res = await api.post(`/flags/${flagId}/allocations`, data);
+      if (res.error) return res;
+      setFlag(f => ({ ...f, allocations: [...f.allocations, res].sort((a, b) => a.priority - b.priority) }));
+    }
+    setEditAlloc(null);
+  }
+
+  async function deleteAlloc(alloc) {
+    if (!confirm('Delete this allocation?')) return;
+    await api.del(`/flags/${flagId}/allocations/${alloc.id}`);
+    setFlag(f => ({ ...f, allocations: f.allocations.filter(a => a.id !== alloc.id) }));
+  }
+
+  async function addField() {
+    if (!fieldForm.name || !fieldForm.label) return;
+    const updatedFields = [...flag.fields, { name: fieldForm.name, label: fieldForm.label, inputType: fieldForm.inputType }];
+    const res = await api.put(`/flags/${flagId}`, { fields: updatedFields });
+    setFlag(f => ({ ...f, fields: res.fields }));
+    setFieldForm({ name: '', label: '', inputType: 'text' });
+    setShowFieldForm(false);
+  }
+
+  async function removeField(name) {
+    const res = await api.put(`/flags/${flagId}`, { fields: flag.fields.filter(f => f.name !== name) });
+    setFlag(f => ({ ...f, fields: res.fields }));
+  }
+
+  if (!flag) return <div style={{ padding: 20, color: '#888' }}>Loading…</div>;
+
+  return (
+    <div>
+      <span className="back-link" onClick={onBack}>← All Flags</span>
+
+      <div className="card">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+          <Toggle checked={flag.enabled} onChange={toggleEnabled} />
+          <TypeBadge type={flag.type} />
+          <h2 style={{ margin: 0, flex: 1 }}>{flag.name}</h2>
+          <span className={`badge badge-${flag.enabled ? 'on' : 'off'}`}>
+            {flag.enabled ? 'ON' : 'OFF'}
+          </span>
+        </div>
+        <div className="flag-key" style={{ display: 'inline-block', marginBottom: flag.description ? 6 : 0 }}>{flag.key}</div>
+        {flag.description && <div style={{ marginTop: 6, color: '#555' }}>{flag.description}</div>}
+      </div>
+
+      {/* Variants */}
+      <div className="card">
+        <div className="section-header">
+          <div className="section-label">Variants <span className="muted" style={{ textTransform: 'none', fontWeight: 400 }}>({flag.type})</span></div>
+        </div>
+        {flag.variants.length > 0 && (
+          <table style={{ marginBottom: 16 }}>
+            <thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
+            <tbody>
+              {flag.variants.map(v => (
+                <tr key={v.id}>
+                  <td><span className="flag-key">{v.key}</span></td>
+                  <td style={{ fontFamily: 'monospace' }}>{v.value}</td>
+                  <td><button className="btn btn-sm btn-danger" onClick={() => deleteVariant(v)}>Delete</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <div className="form-row" style={{ alignItems: 'flex-start' }}>
+          <input className="input" placeholder="key (e.g. control)" value={variantForm.key}
+            onInput={e => setVariantForm(f => ({ ...f, key: e.target.value }))} />
+          <VariantValueInput type={flag.type} value={variantForm.value}
+            onChange={val => setVariantForm(f => ({ ...f, value: val }))} />
+          <button className="btn btn-primary btn-sm" onClick={addVariant} style={{ alignSelf: 'flex-start', marginTop: 2 }}>Add Variant</button>
+        </div>
+      </div>
+
+      {/* Targeting Attributes */}
+      <div className="card">
+        <div className="section-header">
+          <div className="section-label">Targeting Attributes</div>
+          <button className="btn btn-sm" onClick={() => setShowFieldForm(s => !s)}>
+            {showFieldForm ? 'Cancel' : '+ Add Field'}
+          </button>
+        </div>
+        <div className="muted" style={{ marginBottom: 12 }}>Fields available in the rule builder.</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: showFieldForm ? 12 : 0 }}>
+          {flag.fields.map(f => (
+            <span key={f.name} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#f0f0f0', borderRadius: 4, padding: '3px 10px', fontSize: 12 }}>
+              <b>{f.label}</b>
+              <span style={{ color: '#888' }}>({f.name}, {f.inputType})</span>
+              <span style={{ cursor: 'pointer', color: '#c0392b' }} onClick={() => removeField(f.name)}>×</span>
+            </span>
+          ))}
+          {flag.fields.length === 0 && <span className="muted">No fields defined.</span>}
+        </div>
+        {showFieldForm && (
+          <div className="form-row" style={{ marginTop: 8 }}>
+            <input className="input" placeholder="field name" value={fieldForm.name}
+              onInput={e => setFieldForm(f => ({ ...f, name: e.target.value }))} />
+            <input className="input" placeholder="label" value={fieldForm.label}
+              onInput={e => setFieldForm(f => ({ ...f, label: e.target.value }))} />
+            <select className="input" value={fieldForm.inputType} onChange={e => setFieldForm(f => ({ ...f, inputType: e.target.value }))}>
+              <option value="text">text</option>
+              <option value="number">number</option>
+            </select>
+            <button className="btn btn-primary btn-sm" onClick={addField}>Add</button>
+          </div>
+        )}
+      </div>
+
+      {/* Allocations */}
+      <div className="card">
+        <div className="section-header">
+          <div className="section-label">Allocations</div>
+          <button className="btn btn-primary btn-sm"
+            onClick={() => { setEditAlloc(null); setShowAllocModal(true); }}
+            disabled={flag.variants.length === 0}
+            title={flag.variants.length === 0 ? 'Add variants first' : ''}
+          >
+            + Add Allocation
+          </button>
+        </div>
+        <div className="muted" style={{ marginBottom: 12 }}>
+          Evaluated in priority order. First matching allocation determines variant assignment via weighted split.
+        </div>
+        {flag.allocations.length === 0
+          ? <div className="empty-state">No allocations. Users get no variant until you add one.</div>
+          : (
+            <table>
+              <thead>
+                <tr><th>Priority</th><th>Split</th><th>Targeting</th><th></th></tr>
+              </thead>
+              <tbody>
+                {flag.allocations.map(alloc => (
+                  <tr key={alloc.id}>
+                    <td style={{ color: '#888' }}>{alloc.priority}</td>
+                    <td>
+                      {alloc.splits.map(s => (
+                        <span key={s.variant_key} style={{ marginRight: 8, whiteSpace: 'nowrap' }}>
+                          <span className="flag-key">{s.variant_key}</span>
+                          <span className="muted" style={{ marginLeft: 4 }}>{s.weight}%</span>
+                        </span>
+                      ))}
+                    </td>
+                    <td>
+                      {alloc.targeting_rules
+                        ? <span style={{ fontFamily: 'monospace', fontSize: 11, background: '#f0f0f0', padding: '2px 6px', borderRadius: 3, display: 'inline-block', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {JSON.stringify(alloc.targeting_rules)}
+                          </span>
+                        : <span className="muted">catch-all</span>
+                      }
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button className="btn btn-sm" onClick={() => { setEditAlloc(alloc); setShowAllocModal(true); }}>Edit</button>
+                        <button className="btn btn-sm btn-danger" onClick={() => deleteAlloc(alloc)}>Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )
+        }
+      </div>
+
+      {showAllocModal && (
+        <AllocationModal
+          flag={flag}
+          editAlloc={editAlloc}
+          onSave={saveAllocation}
+          onClose={() => { setShowAllocModal(false); setEditAlloc(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Evaluate
+// ---------------------------------------------------------------------------
+
+function samplePayload(flag) {
+  return JSON.stringify({
+    flag_key: flag?.key ?? 'your-flag-key',
+    user_id: 'user-' + Math.floor(Math.random() * 1000),
+    attributes: {
+      country: 'US',
+      plan: 'pro',
+      account_age_days: 45,
+      email: 'user@example.com',
+    },
+  }, null, 2);
+}
+
+function curlCommand(payload) {
+  return `curl -X POST http://localhost:3000/api/evaluate \\\n  -H "Content-Type: application/json" \\\n  -d '${payload.replace(/\n/g, '\n       ')}'`;
+}
+
+function EvaluateView() {
+  const [flags,    setFlags]    = useState([]);
+  const [flagKey,  setFlagKey]  = useState('');
+  const [payload,  setPayload]  = useState('{\n  "flag_key": "",\n  "user_id": "user-123",\n  "attributes": {\n    "country": "US",\n    "plan": "pro"\n  }\n}');
+  const [result,   setResult]   = useState(null);
+  const [error,    setError]    = useState('');
+  const [copied,   setCopied]   = useState(false);
+  const [loading,  setLoading]  = useState(false);
+
+  useEffect(() => { api.get('/flags').then(setFlags); }, []);
+
+  function handleFlagChange(key) {
+    setFlagKey(key);
+    setResult(null);
+    const flag = flags.find(f => f.key === key);
+    if (flag) setPayload(samplePayload(flag));
+  }
+
+  async function evaluate() {
+    setError('');
+    setLoading(true);
+    let body;
+    try { body = JSON.parse(payload); } catch { setError('Invalid JSON in payload'); setLoading(false); return; }
+    const res = await api.post('/evaluate', body);
+    setResult(res);
+    setLoading(false);
+  }
+
+  function copycurl() {
+    navigator.clipboard.writeText(curlCommand(payload));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  const curl = curlCommand(payload);
+
+  return (
+    <div>
+      <div className="card">
+        <h2>Evaluate a Flag</h2>
+
+        <div className="section">
+          <div className="section-label" style={{ marginBottom: 8 }}>Flag (pre-populate payload)</div>
+          <select className="input" value={flagKey} onChange={e => handleFlagChange(e.target.value)}>
+            <option value="">— select a flag —</option>
+            {flags.map(f => <option key={f.id} value={f.key}>{f.key} — {f.name}</option>)}
+          </select>
+        </div>
+
+        <div className="section">
+          <div className="section-label" style={{ marginBottom: 8 }}>Request Payload</div>
+          <textarea
+            className="input"
+            style={{ width: '100%', height: 180, resize: 'vertical', fontFamily: 'monospace', fontSize: 13 }}
+            value={payload}
+            onChange={e => { setPayload(e.target.value); setResult(null); }}
+          />
+          {error && <div className="error">{error}</div>}
+        </div>
+
+        <div className="section">
+          <div className="section-label" style={{ marginBottom: 8 }}>curl</div>
+          <div style={{ position: 'relative' }}>
+            <pre style={{ margin: 0, padding: '12px 44px 12px 14px', background: '#1a1a2e', color: '#a8ff78', borderRadius: 6, fontSize: 12, fontFamily: 'monospace', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{curl}</pre>
+            <button
+              onClick={copycurl}
+              style={{ position: 'absolute', top: 8, right: 8, background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', color: '#fff', borderRadius: 4, padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
+            >
+              {copied ? 'Copied!' : 'Copy'}
+            </button>
+          </div>
+        </div>
+
+        <button className="btn btn-primary" onClick={evaluate} disabled={loading}>
+          {loading ? 'Running…' : 'Run in Browser →'}
+        </button>
+      </div>
+
+      {result && (
+        <div className="card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+            <div className="section-label">Response</div>
+            <span style={{ fontSize: 12, color: '#888' }}>POST /api/evaluate</span>
+          </div>
+          <div className="result-box">{JSON.stringify(result, null, 2)}</div>
+          <div style={{ marginTop: 12, fontSize: 13 }}>
+            {result.error
+              ? <span style={{ color: '#c0392b', fontWeight: 600 }}>✗ Error: {result.error}</span>
+              : result.variant
+                ? <span style={{ color: '#27ae60', fontWeight: 600 }}>✓ Variant <code>{result.variant}</code> → value: <code>{JSON.stringify(result.value)}</code></span>
+                : <span style={{ color: '#e67e22', fontWeight: 600 }}>✗ No variant — reason: {result.reason}</span>
+            }
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Assignments view
+// ---------------------------------------------------------------------------
+
+const REASON_COLORS = {
+  allocated:              { bg: '#d4edda', fg: '#155724' },
+  no_matching_allocation: { bg: '#fff3cd', fg: '#856404' },
+  flag_disabled:          { bg: '#f8d7da', fg: '#721c24' },
+  split_exhausted:        { bg: '#f8d7da', fg: '#721c24' },
+};
+
+function ReasonBadge({ reason }) {
+  const c = REASON_COLORS[reason] ?? { bg: '#e9ecef', fg: '#495057' };
+  return (
+    <span style={{ background: c.bg, color: c.fg, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap' }}>
+      {reason}
+    </span>
+  );
+}
+
+function AssignmentsView() {
+  const [data,       setData]       = useState(null);
+  const [flagFilter, setFlagFilter] = useState('');
+  const [flags,      setFlags]      = useState([]);
+  const PAGE = 50;
+  const [offset, setOffset] = useState(0);
+
+  useEffect(() => { api.get('/flags').then(setFlags); }, []);
+
+  useEffect(() => {
+    load(0);
+  }, [flagFilter]);
+
+  async function load(nextOffset = offset) {
+    const qs = new URLSearchParams({ limit: PAGE, offset: nextOffset });
+    if (flagFilter) qs.set('flag_key', flagFilter);
+    const res = await api.get(`/assignments?${qs}`);
+    setData(res);
+    setOffset(nextOffset);
+  }
+
+  async function clearAll() {
+    if (!confirm('Delete all assignment records?')) return;
+    await api.del('/assignments');
+    load(0);
+  }
+
+  const rows  = data?.rows  ?? [];
+  const total = data?.total ?? 0;
+
+  return (
+    <div>
+      <div className="card">
+        <div className="section-header" style={{ marginBottom: 16 }}>
+          <h2 style={{ margin: 0 }}>Experiment Assignments</h2>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <select className="input" value={flagFilter} onChange={e => setFlagFilter(e.target.value)}>
+              <option value="">All flags</option>
+              {flags.map(f => <option key={f.id} value={f.key}>{f.key}</option>)}
+            </select>
+            <button className="btn btn-sm" onClick={() => load(0)}>Refresh</button>
+            <button className="btn btn-sm btn-danger" onClick={clearAll}>Clear All</button>
+          </div>
+        </div>
+
+        <div className="muted" style={{ marginBottom: 12 }}>
+          {total} total record{total !== 1 ? 's' : ''}{flagFilter ? ` for "${flagFilter}"` : ''}
+        </div>
+
+        {rows.length === 0
+          ? <div className="empty-state">No assignments yet. Run an evaluation to see records here.</div>
+          : (
+            <div style={{ overflowX: 'auto' }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Flag</th>
+                    <th>User ID</th>
+                    <th>Variant</th>
+                    <th>Value</th>
+                    <th>Bucket</th>
+                    <th>Reason</th>
+                    <th>Attributes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map(row => (
+                    <tr key={row.id}>
+                      <td style={{ whiteSpace: 'nowrap', color: '#888', fontSize: 12 }}>
+                        {row.assigned_at.replace('T', ' ').slice(0, 19)}
+                      </td>
+                      <td><span className="flag-key">{row.flag_key}</span></td>
+                      <td style={{ fontFamily: 'monospace', fontSize: 12 }}>{row.user_id}</td>
+                      <td>
+                        {row.variant
+                          ? <span className="flag-key">{row.variant}</span>
+                          : <span className="muted">—</span>
+                        }
+                      </td>
+                      <td style={{ fontFamily: 'monospace', fontSize: 12, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {row.value ?? <span className="muted">—</span>}
+                      </td>
+                      <td style={{ color: '#888', fontSize: 12 }}>{row.bucket ?? '—'}</td>
+                      <td><ReasonBadge reason={row.reason} /></td>
+                      <td>
+                        <span
+                          style={{ fontFamily: 'monospace', fontSize: 11, color: '#888', cursor: 'pointer' }}
+                          title={row.attributes}
+                          onClick={() => alert(JSON.stringify(JSON.parse(row.attributes ?? '{}'), null, 2))}
+                        >
+                          {row.attributes ? '{…}' : '—'}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+
+        {total > PAGE && (
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 16, justifyContent: 'flex-end' }}>
+            <button className="btn btn-sm" onClick={() => load(Math.max(0, offset - PAGE))} disabled={offset === 0}>← Prev</button>
+            <span className="muted">{offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
+            <button className="btn btn-sm" onClick={() => load(offset + PAGE)} disabled={offset + PAGE >= total}>Next →</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App root
+// ---------------------------------------------------------------------------
+
+function App() {
+  const [view,       setView]       = useState('flags');
+  const [selectedId, setSelectedId] = useState(null);
+
+  function goToFlag(id) { setSelectedId(id); setView('flag-detail'); }
+  function goToFlags()  { setSelectedId(null); setView('flags'); }
+
+  return (
+    <div>
+      <header>
+        <h1>Experiment Platform</h1>
+        <nav>
+          <button className={view === 'flags' || view === 'flag-detail' ? 'active' : ''} onClick={goToFlags}>Flags</button>
+          <button className={view === 'evaluate' ? 'active' : ''} onClick={() => setView('evaluate')}>Evaluate</button>
+          <button className={view === 'assignments' ? 'active' : ''} onClick={() => setView('assignments')}>Assignments</button>
+        </nav>
+      </header>
+      <main>
+        {view === 'flags'       && <FlagList onSelectFlag={goToFlag} />}
+        {view === 'flag-detail' && <FlagDetail flagId={selectedId} onBack={goToFlags} />}
+        {view === 'evaluate'    && <EvaluateView />}
+        {view === 'assignments' && <AssignmentsView />}
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
