@@ -22,11 +22,21 @@ function parseAllocation(row) {
   };
 }
 
+// Returns false and sends a 409 if the flag is currently running.
+// Use this to guard all variant/allocation mutation endpoints.
+async function assertNotRunning(flagId, reply) {
+  const flag = await db.get('SELECT status FROM flags WHERE id = ?', [flagId]);
+  if (!flag) { reply.code(404).send({ error: 'Not found' }); return false; }
+  if (flag.status === 'running') {
+    reply.code(409).send({ error: 'Experiment is running. Stop the experiment before modifying variants or allocations.' });
+    return false;
+  }
+  return true;
+}
+
 export default async function flagRoutes(app) {
 
   // ── SDK config endpoint ────────────────────────────────────────────────────
-  // Returns all enabled flags with their variants and allocations in one call.
-  // Designed for SDK polling — callers use this to evaluate flags locally.
 
   app.get('/sdk/config', async () => {
     const flags = await db.all("SELECT * FROM flags WHERE enabled = 1 ORDER BY created_at DESC");
@@ -91,6 +101,29 @@ export default async function flagRoutes(app) {
     return parseFlag(await db.get('SELECT * FROM flags WHERE id = ?', [flag.id]));
   });
 
+  // ── Experiment lifecycle ───────────────────────────────────────────────────
+  // Transitions: draft → running → stopped → draft (reset) or stopped → running (restart)
+
+  app.put('/flags/:id/status', async (req, reply) => {
+    const flag = parseFlag(await db.get('SELECT * FROM flags WHERE id = ?', [req.params.id]));
+    if (!flag) return reply.code(404).send({ error: 'Not found' });
+    const { status } = req.body;
+    if (!['draft', 'running', 'stopped'].includes(status))
+      return reply.code(400).send({ error: 'status must be draft, running, or stopped' });
+
+    let startedAt = flag.started_at ?? null;
+    if (status === 'running') {
+      // Fresh start: record timestamp (overwrite if restarting from stopped)
+      startedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    } else if (status === 'draft') {
+      // Reset to draft clears the start time so a future run begins clean
+      startedAt = null;
+    }
+
+    await db.run('UPDATE flags SET status = ?, started_at = ? WHERE id = ?', [status, startedAt, flag.id]);
+    return parseFlag(await db.get('SELECT * FROM flags WHERE id = ?', [flag.id]));
+  });
+
   app.delete('/flags/:id', async (req, reply) => {
     const flag = await db.get('SELECT * FROM flags WHERE id = ?', [req.params.id]);
     if (!flag) return reply.code(404).send({ error: 'Not found' });
@@ -101,6 +134,7 @@ export default async function flagRoutes(app) {
   // ── Variants ───────────────────────────────────────────────────────────────
 
   app.post('/flags/:id/variants', async (req, reply) => {
+    if (!await assertNotRunning(req.params.id, reply)) return;
     const { key, value } = req.body;
     if (!key || value === undefined) return reply.code(400).send({ error: 'key and value are required' });
     const r = await db.run(
@@ -111,6 +145,7 @@ export default async function flagRoutes(app) {
   });
 
   app.delete('/flags/:flagId/variants/:variantId', async (req, reply) => {
+    if (!await assertNotRunning(req.params.flagId, reply)) return;
     const v = await db.get('SELECT * FROM variants WHERE id = ? AND flag_id = ?', [req.params.variantId, req.params.flagId]);
     if (!v) return reply.code(404).send({ error: 'Not found' });
     await db.run('DELETE FROM variants WHERE id = ?', [v.id]);
@@ -120,6 +155,7 @@ export default async function flagRoutes(app) {
   // ── Allocations ────────────────────────────────────────────────────────────
 
   app.post('/flags/:id/allocations', async (req, reply) => {
+    if (!await assertNotRunning(req.params.id, reply)) return;
     const { splits, targeting_rules, priority } = req.body;
     if (!splits?.length) return reply.code(400).send({ error: 'splits is required' });
     const total = splits.reduce((s, x) => s + x.weight, 0);
@@ -134,6 +170,7 @@ export default async function flagRoutes(app) {
   });
 
   app.put('/flags/:flagId/allocations/:allocId', async (req, reply) => {
+    if (!await assertNotRunning(req.params.flagId, reply)) return;
     const alloc = await db.get('SELECT * FROM allocations WHERE id = ? AND flag_id = ?', [req.params.allocId, req.params.flagId]);
     if (!alloc) return reply.code(404).send({ error: 'Not found' });
 
@@ -158,6 +195,7 @@ export default async function flagRoutes(app) {
   });
 
   app.delete('/flags/:flagId/allocations/:allocId', async (req, reply) => {
+    if (!await assertNotRunning(req.params.flagId, reply)) return;
     const alloc = await db.get('SELECT * FROM allocations WHERE id = ? AND flag_id = ?', [req.params.allocId, req.params.flagId]);
     if (!alloc) return reply.code(404).send({ error: 'Not found' });
     await db.run('DELETE FROM allocations WHERE id = ?', [alloc.id]);

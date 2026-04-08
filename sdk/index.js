@@ -13,10 +13,49 @@
  *   const result = client.evaluate('my-flag', 'user-123', { country: 'US' });
  *   client.logAssignment('my-flag', 'user-123', result, { country: 'US' });
  *
- *   client.close(); // stop polling
+ *   await client.close(); // flush queue and stop polling
  */
 
 import { evaluateFlag } from '../lib/evaluate.js';
+
+// ---------------------------------------------------------------------------
+// Internal retry queue
+// ---------------------------------------------------------------------------
+
+const RETRY_DELAYS_MS = [1_000, 2_000, 4_000]; // 3 attempts with exponential backoff
+
+async function fetchWithRetry(url, init, maxQueueSize, queue, onError) {
+  const body = init.body; // serialised once, reused across retries
+  let attempt = 0;
+
+  const attempt_ = async () => {
+    try {
+      const res = await fetch(url, { ...init, body });
+      if (res.ok) {
+        queue.delete(attempt_);
+        return;
+      }
+      throw new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      if (attempt < RETRY_DELAYS_MS.length) {
+        const delay = RETRY_DELAYS_MS[attempt++];
+        setTimeout(attempt_, delay);
+      } else {
+        queue.delete(attempt_);
+        onError?.(new Error(`logAssignment failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${e.message}`));
+      }
+    }
+  };
+
+  // Shed load if queue is full
+  if (queue.size >= maxQueueSize) {
+    onError?.(new Error(`logAssignment queue full (${maxQueueSize}), dropping event`));
+    return;
+  }
+
+  queue.add(attempt_);
+  attempt_();
+}
 
 // ---------------------------------------------------------------------------
 // ExperimentClient
@@ -25,22 +64,26 @@ import { evaluateFlag } from '../lib/evaluate.js';
 export class ExperimentClient {
   #host;
   #pollingInterval;
+  #maxQueueSize;
   #onError;
-  #flags = new Map(); // flagKey → full flag object (with variants + allocations)
-  #timer = null;
+  #flags       = new Map(); // flagKey → full flag object (with variants + allocations)
+  #timer       = null;
+  #logQueue    = new Set(); // in-flight log attempts (for flush on close)
   #initialized = false;
 
   /**
-   * @param {object} options
-   * @param {string}   options.host             Base URL of the experiment platform server
-   * @param {number}  [options.pollingInterval]  Config refresh interval in ms (default 60 000)
-   * @param {Function}[options.onError]          Called with Error on config fetch failures.
-   *                                             If omitted, errors are silently swallowed and
-   *                                             the stale config is retained.
+   * @param {object}   options
+   * @param {string}   options.host              Base URL of the experiment platform server
+   * @param {number}  [options.pollingInterval]   Config refresh interval in ms (default 60 000)
+   * @param {number}  [options.maxQueueSize]      Max concurrent in-flight log attempts before
+   *                                              events are dropped (default 500)
+   * @param {Function}[options.onError]           Called with Error on config fetch or log failures.
+   *                                              If omitted, errors are silently swallowed.
    */
-  constructor({ host, pollingInterval = 60_000, onError = null }) {
+  constructor({ host, pollingInterval = 60_000, maxQueueSize = 500, onError = null }) {
     this.#host            = host.replace(/\/$/, '');
     this.#pollingInterval = pollingInterval;
+    this.#maxQueueSize    = maxQueueSize;
     this.#onError         = onError;
   }
 
@@ -71,16 +114,16 @@ export class ExperimentClient {
     if (!this.#initialized) {
       throw new Error('ExperimentClient.init() must be awaited before calling evaluate()');
     }
-
     const flag = this.#flags.get(flagKey);
     if (!flag) return { variant: null, value: null, reason: 'unknown_flag' };
     return evaluateFlag(flag, userId, attributes);
   }
 
   /**
-   * Log a pre-computed assignment back to the server asynchronously.
-   * Fire-and-forget — returns immediately without waiting for the response.
-   * Errors are silently swallowed; wire up onError in the constructor if you need them.
+   * Log a pre-computed assignment back to the server.
+   * Returns immediately — delivery is handled asynchronously with up to 3 retries
+   * (1 s, 2 s, 4 s backoff). If the queue is full, the event is dropped and onError
+   * is called. Errors are never thrown from this method.
    *
    * @param {string} flagKey
    * @param {string} userId
@@ -88,24 +131,30 @@ export class ExperimentClient {
    * @param {object} [attributes]
    */
   logAssignment(flagKey, userId, result, attributes = {}) {
-    fetch(`${this.#host}/api/assignments`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        flag_key:      flagKey,
-        user_id:       userId,
-        variant:       result.variant       ?? null,
-        value:         result.value         ?? null,
-        reason:        result.reason,
-        bucket:        result.bucket        ?? null,
-        allocation_id: result.allocation_id ?? null,
-        attributes,
-      }),
-    }).catch(e => this.#onError?.(e));
+    fetchWithRetry(
+      `${this.#host}/api/assignments`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          flag_key:      flagKey,
+          user_id:       userId,
+          variant:       result.variant       ?? null,
+          value:         result.value         ?? null,
+          reason:        result.reason,
+          bucket:        result.bucket        ?? null,
+          allocation_id: result.allocation_id ?? null,
+          attributes,
+        }),
+      },
+      this.#maxQueueSize,
+      this.#logQueue,
+      this.#onError,
+    );
   }
 
   /**
-   * Return the number of flags currently in the local cache.
+   * Number of flags currently in the local cache.
    * Useful for health checks after init().
    */
   get flagCount() {
@@ -113,12 +162,28 @@ export class ExperimentClient {
   }
 
   /**
-   * Stop the polling interval. Call this on shutdown.
+   * Number of assignment log events currently in-flight (queued or being retried).
+   * Useful for observability / graceful shutdown decisions.
    */
-  close() {
+  get pendingLogCount() {
+    return this.#logQueue.size;
+  }
+
+  /**
+   * Stop polling and wait for all in-flight log attempts to settle (up to timeoutMs).
+   * Call this during graceful shutdown to avoid dropping assignments.
+   *
+   * @param {number} [timeoutMs=5000]
+   */
+  async close(timeoutMs = 5_000) {
     if (this.#timer) {
       clearInterval(this.#timer);
       this.#timer = null;
+    }
+    if (this.#logQueue.size === 0) return;
+    const deadline = Date.now() + timeoutMs;
+    while (this.#logQueue.size > 0 && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 50));
     }
   }
 

@@ -21,6 +21,8 @@ raw.exec(`
     type        TEXT NOT NULL DEFAULT 'boolean',
     enabled     INTEGER NOT NULL DEFAULT 1,
     fields      TEXT NOT NULL DEFAULT '[]',
+    status      TEXT NOT NULL DEFAULT 'draft',
+    started_at  TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -85,6 +87,19 @@ if (version < 1) {
     }
 
     raw.pragma(`user_version = 1`);
+    raw.exec(`COMMIT`);
+  } catch (e) {
+    raw.exec(`ROLLBACK`);
+    throw e;
+  }
+}
+
+if (version < 2) {
+  raw.exec(`BEGIN`);
+  try {
+    try { raw.exec(`ALTER TABLE flags ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'`); } catch {}
+    try { raw.exec(`ALTER TABLE flags ADD COLUMN started_at TEXT`); } catch {}
+    raw.pragma(`user_version = 2`);
     raw.exec(`COMMIT`);
   } catch (e) {
     raw.exec(`ROLLBACK`);

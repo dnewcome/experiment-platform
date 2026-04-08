@@ -374,9 +374,8 @@ function FlagList({ onSelectFlag }) {
               <TypeBadge type={flag.type} />
               <span className="flag-key">{flag.key}</span>
               <span className="flag-name">{flag.name}</span>
-              <span className={`badge badge-${flag.enabled ? 'on' : 'off'}`}>
-                {flag.enabled ? 'ON' : 'OFF'}
-              </span>
+              <span className={`badge badge-${flag.enabled ? 'on' : 'off'}`}>{flag.enabled ? 'ON' : 'OFF'}</span>
+              <span className={`badge badge-${flag.status ?? 'draft'}`}>{flag.status ?? 'draft'}</span>
               <button className="btn btn-sm" onClick={() => onSelectFlag(flag.id)}>Edit →</button>
               <button className="btn btn-sm btn-danger" onClick={() => deleteFlag(flag)}>Delete</button>
             </div>
@@ -463,6 +462,54 @@ function AllocationModal({ flag, editAlloc, onSave, onClose }) {
 // Flag Detail
 // ---------------------------------------------------------------------------
 
+function SrmWidget({ flagKey, startedAt }) {
+  const [srm, setSrm] = useState(null);
+
+  useEffect(() => {
+    if (!flagKey) return;
+    const qs = startedAt ? `?since=${encodeURIComponent(startedAt)}` : '';
+    api.get(`/srm/${flagKey}${qs}`).then(r => { if (!r.error) setSrm(r); });
+  }, [flagKey, startedAt]);
+
+  if (!srm) return null;
+  if (srm.total < 100) return (
+    <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+      SRM check requires ≥ 100 allocated users (have {srm.total}).
+    </div>
+  );
+
+  const variantKeys = Object.keys(srm.observed);
+  return (
+    <div style={{ marginTop: 12, padding: '12px 14px', borderRadius: 6, background: srm.srm ? '#fff3cd' : '#f8f9fc', border: `1px solid ${srm.srm ? '#ffc107' : '#e5e5e5'}` }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+        <b style={{ fontSize: 13 }}>Sample Ratio Mismatch</b>
+        <span style={{ fontSize: 12, fontWeight: 700, padding: '2px 10px', borderRadius: 10, background: srm.srm ? '#ffc107' : '#d4edda', color: srm.srm ? '#856404' : '#155724' }}>
+          {srm.srm ? '⚠ SRM DETECTED' : '✓ No SRM'}
+        </span>
+        <span className="muted" style={{ fontSize: 11 }}>χ² = {srm.chiSq} · p = {srm.pValue} · n = {srm.total}</span>
+      </div>
+      <table style={{ width: 'auto', fontSize: 12 }}>
+        <thead><tr><th>Variant</th><th style={{ textAlign: 'right' }}>Expected</th><th style={{ textAlign: 'right' }}>Observed</th><th style={{ textAlign: 'right' }}>Δ</th></tr></thead>
+        <tbody>
+          {variantKeys.map(v => {
+            const obs = srm.observed[v] ?? 0, exp = srm.expected[v] ?? 0;
+            const delta = obs - exp, pct = exp ? ((delta / exp) * 100).toFixed(1) : '—';
+            return (
+              <tr key={v}>
+                <td><span className="flag-key">{v}</span></td>
+                <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{exp}</td>
+                <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{obs}</td>
+                <td style={{ textAlign: 'right', fontFamily: 'monospace', color: Math.abs(delta) > exp * 0.05 ? '#856404' : '#888' }}>{delta >= 0 ? '+' : ''}{pct}%</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {srm.srm && <div style={{ marginTop: 8, fontSize: 12, color: '#856404' }}>The assignment ratio does not match the configured split weights. This likely indicates a bug in targeting rules or assignment logging. Results from this experiment should not be trusted until the cause is identified and fixed.</div>}
+    </div>
+  );
+}
+
 function FlagDetail({ flagId, onBack }) {
   const [flag,           setFlag]           = useState(null);
   const [variantForm,    setVariantForm]    = useState({ key: '', value: '' });
@@ -476,6 +523,12 @@ function FlagDetail({ flagId, onBack }) {
   async function toggleEnabled() {
     const res = await api.put(`/flags/${flagId}`, { enabled: !flag.enabled });
     setFlag(f => ({ ...f, enabled: res.enabled }));
+  }
+
+  async function setStatus(status) {
+    const res = await api.put(`/flags/${flagId}/status`, { status });
+    if (res.error) { alert(res.error); return; }
+    setFlag(f => ({ ...f, status: res.status, started_at: res.started_at }));
   }
 
   async function addVariant() {
@@ -530,6 +583,9 @@ function FlagDetail({ flagId, onBack }) {
 
   if (!flag) return <div style={{ padding: 20, color: '#888' }}>Loading…</div>;
 
+  const isRunning = flag.status === 'running';
+  const lockedMsg = 'Stop the experiment to make changes';
+
   return (
     <div>
       <span className="back-link" onClick={onBack}>← All Flags</span>
@@ -539,12 +595,47 @@ function FlagDetail({ flagId, onBack }) {
           <Toggle checked={flag.enabled} onChange={toggleEnabled} />
           <TypeBadge type={flag.type} />
           <h2 style={{ margin: 0, flex: 1 }}>{flag.name}</h2>
-          <span className={`badge badge-${flag.enabled ? 'on' : 'off'}`}>
-            {flag.enabled ? 'ON' : 'OFF'}
-          </span>
+          <span className={`badge badge-${flag.enabled ? 'on' : 'off'}`}>{flag.enabled ? 'ON' : 'OFF'}</span>
         </div>
         <div className="flag-key" style={{ display: 'inline-block', marginBottom: flag.description ? 6 : 0 }}>{flag.key}</div>
         {flag.description && <div style={{ marginTop: 6, color: '#555' }}>{flag.description}</div>}
+      </div>
+
+      {/* SRM widget — shown when experiment has run */}
+      {(flag.status === 'running' || flag.status === 'stopped') && (
+        <SrmWidget flagKey={flag.key} startedAt={flag.started_at} />
+      )}
+
+      {/* Experiment lifecycle bar */}
+      <div className={`experiment-bar ${flag.status ?? 'draft'}`}>
+        <span className={`badge badge-${flag.status ?? 'draft'}`} style={{ fontSize: 12 }}>
+          {(flag.status ?? 'draft').toUpperCase()}
+        </span>
+        {flag.status === 'running' && flag.started_at && (
+          <span style={{ color: '#155724', fontSize: 12 }}>Started {flag.started_at}</span>
+        )}
+        {flag.status === 'stopped' && flag.started_at && (
+          <span style={{ color: '#721c24', fontSize: 12 }}>Ran from {flag.started_at}</span>
+        )}
+        {(!flag.status || flag.status === 'draft') && (
+          <span className="muted">Configure variants and allocations, then start the experiment to lock the configuration.</span>
+        )}
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          {(!flag.status || flag.status === 'draft') && (
+            <button className="btn btn-sm btn-primary" onClick={() => setStatus('running')}
+              disabled={!flag.allocations?.length}
+              title={!flag.allocations?.length ? 'Add an allocation before starting' : ''}>
+              ▶ Start Experiment
+            </button>
+          )}
+          {flag.status === 'running' && (
+            <button className="btn btn-sm btn-danger" onClick={() => setStatus('stopped')}>■ Stop Experiment</button>
+          )}
+          {flag.status === 'stopped' && (<>
+            <button className="btn btn-sm btn-primary" onClick={() => setStatus('running')}>▶ Restart Experiment</button>
+            <button className="btn btn-sm" onClick={() => { if (confirm('Reset to draft? This clears the start time.')) setStatus('draft'); }}>Reset to Draft</button>
+          </>)}
+        </div>
       </div>
 
       {/* Variants */}
@@ -560,7 +651,7 @@ function FlagDetail({ flagId, onBack }) {
                 <tr key={v.id}>
                   <td><span className="flag-key">{v.key}</span></td>
                   <td style={{ fontFamily: 'monospace' }}>{v.value}</td>
-                  <td><button className="btn btn-sm btn-danger" onClick={() => deleteVariant(v)}>Delete</button></td>
+                  <td><button className="btn btn-sm btn-danger" onClick={() => deleteVariant(v)} disabled={isRunning} title={isRunning ? lockedMsg : ''}>Delete</button></td>
                 </tr>
               ))}
             </tbody>
@@ -568,10 +659,12 @@ function FlagDetail({ flagId, onBack }) {
         )}
         <div className="form-row" style={{ alignItems: 'flex-start' }}>
           <input className="input" placeholder="key (e.g. control)" value={variantForm.key}
-            onInput={e => setVariantForm(f => ({ ...f, key: e.target.value }))} />
+            onInput={e => setVariantForm(f => ({ ...f, key: e.target.value }))} disabled={isRunning} />
           <VariantValueInput type={flag.type} value={variantForm.value}
-            onChange={val => setVariantForm(f => ({ ...f, value: val }))} />
-          <button className="btn btn-primary btn-sm" onClick={addVariant} style={{ alignSelf: 'flex-start', marginTop: 2 }}>Add Variant</button>
+            onChange={val => setVariantForm(f => ({ ...f, value: val }))} disabled={isRunning} />
+          <button className="btn btn-primary btn-sm" onClick={addVariant} style={{ alignSelf: 'flex-start', marginTop: 2 }}
+            disabled={isRunning} title={isRunning ? lockedMsg : ''}>Add Variant</button>
+          {isRunning && <span className="muted" style={{ fontSize: 12 }}>🔒 {lockedMsg}</span>}
         </div>
       </div>
 
@@ -615,8 +708,8 @@ function FlagDetail({ flagId, onBack }) {
           <div className="section-label">Allocations</div>
           <button className="btn btn-primary btn-sm"
             onClick={() => { setEditAlloc(null); setShowAllocModal(true); }}
-            disabled={flag.variants.length === 0}
-            title={flag.variants.length === 0 ? 'Add variants first' : ''}
+            disabled={flag.variants.length === 0 || isRunning}
+            title={isRunning ? lockedMsg : flag.variants.length === 0 ? 'Add variants first' : ''}
           >
             + Add Allocation
           </button>
@@ -653,8 +746,8 @@ function FlagDetail({ flagId, onBack }) {
                     </td>
                     <td>
                       <div style={{ display: 'flex', gap: 6 }}>
-                        <button className="btn btn-sm" onClick={() => { setEditAlloc(alloc); setShowAllocModal(true); }}>Edit</button>
-                        <button className="btn btn-sm btn-danger" onClick={() => deleteAlloc(alloc)}>Delete</button>
+                        <button className="btn btn-sm" onClick={() => { setEditAlloc(alloc); setShowAllocModal(true); }} disabled={isRunning} title={isRunning ? lockedMsg : ''}>Edit</button>
+                        <button className="btn btn-sm btn-danger" onClick={() => deleteAlloc(alloc)} disabled={isRunning} title={isRunning ? lockedMsg : ''}>Delete</button>
                       </div>
                     </td>
                   </tr>
