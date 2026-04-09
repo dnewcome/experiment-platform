@@ -48,14 +48,29 @@ if (!dsExists) {
 // Query helper
 // ---------------------------------------------------------------------------
 
+// BigQuery cannot infer types for null parameters. Replace every ? that maps
+// to a null/undefined value with the SQL NULL literal so no type hint is needed.
+function inlineNulls(sql, params) {
+  const kept = [];
+  let i = 0;
+  const out = sql.replace(/\?/g, () => {
+    const v = params[i++];
+    if (v === null || v === undefined) return 'NULL';
+    kept.push(v);
+    return '?';
+  });
+  return { sql: out, params: kept };
+}
+
 async function runQuery(sql, params = []) {
+  const { sql: finalSql, params: finalParams } = inlineNulls(sql, params);
   const options = {
-    query: sql,
+    query: finalSql,
     defaultDataset: { datasetId, projectId },
     location,
   };
-  if (params.length > 0) {
-    options.params  = params;
+  if (finalParams.length > 0) {
+    options.params        = finalParams;
     options.parameterMode = 'POSITIONAL';
   }
   const [rows] = await bq.query(options);
@@ -77,86 +92,123 @@ function normalizeRow(row) {
 // Schema
 // ---------------------------------------------------------------------------
 
-const TIMESTAMP_DEFAULT = "FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP())";
-
-// Timestamps are stored as STRING to preserve lexicographic comparison
-// compatibility with the SQLite adapter (routes use string literals in WHERE).
+// Timestamps stored as STRING for lexicographic comparison compatibility with
+// the SQLite adapter (routes compare with string literals in WHERE clauses).
+// DEFAULT and NOT NULL are omitted — BigQuery's query API does not support
+// DEFAULT expressions in CREATE TABLE DDL. Missing defaults are injected by
+// the adapter's run() method instead.
 
 await runQuery(`
   CREATE TABLE IF NOT EXISTS flags (
     id          INT64,
-    key         STRING NOT NULL,
-    name        STRING NOT NULL,
+    key         STRING,
+    name        STRING,
     description STRING,
-    type        STRING NOT NULL DEFAULT 'boolean',
-    enabled     INT64  NOT NULL DEFAULT 1,
-    fields      STRING NOT NULL DEFAULT '[]',
-    status      STRING NOT NULL DEFAULT 'draft',
+    type        STRING,
+    enabled     INT64,
+    fields      STRING,
+    status      STRING,
     started_at  STRING,
-    created_at  STRING NOT NULL DEFAULT (${TIMESTAMP_DEFAULT})
+    created_at  STRING
   )
 `);
 
 await runQuery(`
   CREATE TABLE IF NOT EXISTS variants (
     id       INT64,
-    flag_id  INT64  NOT NULL,
-    key      STRING NOT NULL,
-    value    STRING NOT NULL
+    flag_id  INT64,
+    key      STRING,
+    value    STRING
   )
 `);
 
 await runQuery(`
   CREATE TABLE IF NOT EXISTS allocations (
     id               INT64,
-    flag_id          INT64  NOT NULL,
-    splits           STRING NOT NULL DEFAULT '[]',
+    flag_id          INT64,
+    splits           STRING,
     targeting_rules  STRING,
-    priority         INT64  NOT NULL DEFAULT 0
+    priority         INT64
   )
 `);
 
 await runQuery(`
   CREATE TABLE IF NOT EXISTS experiment_assignments (
     id            INT64,
-    flag_key      STRING NOT NULL,
-    user_id       STRING NOT NULL,
+    flag_key      STRING,
+    user_id       STRING,
     variant       STRING,
     value         STRING,
-    reason        STRING NOT NULL,
+    reason        STRING,
     bucket        INT64,
     allocation_id INT64,
     attributes    STRING,
-    assigned_at   STRING NOT NULL DEFAULT (${TIMESTAMP_DEFAULT})
+    assigned_at   STRING
   )
 `);
 
 await runQuery(`
   CREATE TABLE IF NOT EXISTS metric_events (
     id          INT64,
-    flag_key    STRING NOT NULL,
-    user_id     STRING NOT NULL,
-    metric_name STRING NOT NULL,
-    value       FLOAT64 NOT NULL DEFAULT 1.0,
-    event_at    STRING DEFAULT (${TIMESTAMP_DEFAULT})
+    flag_key    STRING,
+    user_id     STRING,
+    metric_name STRING,
+    value       FLOAT64,
+    event_at    STRING
   )
 `);
 
 // ---------------------------------------------------------------------------
-// INSERT id injection
-// BigQuery has no AUTOINCREMENT. For every INSERT that omits the id column,
-// we generate a random INT64 and prepend it to the column list and params.
+// INSERT default injection
+//
+// BigQuery has no AUTOINCREMENT and the query API doesn't support column
+// DEFAULT expressions. For every INSERT we:
+//   1. Generate a random id.
+//   2. Inject any table-specific defaults for columns absent from the statement.
 // ---------------------------------------------------------------------------
 
-function injectId(sql, params) {
+const now = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+// Columns to inject when absent from the INSERT, keyed by table name.
+// Values that are functions are called at insert time.
+const TABLE_DEFAULTS = {
+  flags: {
+    enabled:    1,
+    status:     'draft',
+    created_at: now,
+  },
+  experiment_assignments: {
+    assigned_at: now,
+  },
+};
+
+function injectDefaults(sql, params) {
   // Match: INSERT INTO <table> (<cols>) VALUES (<placeholders>)
-  const m = sql.match(/^(\s*INSERT\s+INTO\s+\S+\s*)\(([^)]*)\)(\s*VALUES\s*)\(([^)]*)\)/i);
-  if (!m || /\bid\b/i.test(m[2])) {
-    return { sql, params, insertedId: null };
+  const m = sql.match(/^(\s*INSERT\s+INTO\s+(\S+)\s*)\(([^)]*)\)(\s*VALUES\s*)\(([^)]*)\)/i);
+  if (!m) return { sql, params, insertedId: null };
+
+  const table     = m[2].toLowerCase();
+  const existCols = m[3].split(',').map(c => c.trim().toLowerCase());
+
+  // Skip if id is already present
+  if (existCols.includes('id')) return { sql, params, insertedId: null };
+
+  const id       = randomInt(1, 2 ** 48); // crypto.randomInt max range is 2^48
+  const addCols  = ['id'];
+  const addVals  = [id];
+
+  for (const [col, val] of Object.entries(TABLE_DEFAULTS[table] ?? {})) {
+    if (!existCols.includes(col)) {
+      addCols.push(col);
+      addVals.push(typeof val === 'function' ? val() : val);
+    }
   }
-  const id = randomInt(1, 2 ** 50); // safe JS integer, fits INT64
-  const newSql = `${m[1]}(id, ${m[2].trim()})${m[3]}(?, ${m[4].trim()})`;
-  return { sql: newSql, params: [id, ...params], insertedId: id };
+
+  const newCols  = [...addCols, ...m[3].split(',').map(c => c.trim())];
+  const newVals  = [...addVals.map(() => '?'), ...m[5].split(',').map(c => c.trim())];
+  const newSql   = `${m[1]}(${newCols.join(', ')})${m[4]}(${newVals.join(', ')})`;
+
+  return { sql: newSql, params: [...addVals, ...params], insertedId: id };
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +232,7 @@ const db = {
   async run(sql, params = []) {
     const trimmed = sql.trimStart().toUpperCase();
     if (trimmed.startsWith('INSERT')) {
-      const { sql: rewritten, params: rewrittenParams, insertedId } = injectId(sql, params);
+      const { sql: rewritten, params: rewrittenParams, insertedId } = injectDefaults(sql, params);
       await runQuery(rewritten, rewrittenParams);
       return { lastInsertRowid: insertedId, changes: 1 };
     }
