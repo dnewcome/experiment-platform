@@ -532,6 +532,7 @@ function AllocationModal({ flag, editAlloc, onSave, onClose }) {
 function ResultsCard({ flag }) {
   const [metricNames,  setMetricNames]  = useState([]);
   const [metric,       setMetric]       = useState('');
+  const [method,       setMethod]       = useState('fixed_sample');
   const [results,      setResults]      = useState(null);
   const [loading,      setLoading]      = useState(false);
   const [importText,   setImportText]   = useState('');
@@ -579,20 +580,27 @@ function ResultsCard({ flag }) {
     api.get(`/metrics/names?flag_key=${flag.key}`).then(r => { if (Array.isArray(r)) setMetricNames(r); });
   }
 
-  // Reuse stats functions defined earlier in the file
   function analyze() {
     if (!results || results.variants.length < 2) return null;
     const ctrl = results.variants[0];
     return results.variants.slice(1).map(trt => {
       if (!ctrl.assigned || !trt.assigned) return null;
-      const freq = zTestProportions(ctrl.assigned, ctrl.converted, trt.assigned, trt.converted);
-      const bay  = bayesianTest(ctrl.assigned, ctrl.converted, trt.assigned, trt.converted);
-      const sp1  = flag.allocations[0]?.splits?.find(s => s.variant_key === ctrl.variant);
-      const sp2  = flag.allocations[0]?.splits?.find(s => s.variant_key === trt.variant);
-      const w1   = (sp1?.weight ?? 50) / 100, w2 = (sp2?.weight ?? 50) / 100;
-      const pow  = computePower(ctrl.assigned, trt.assigned, ctrl.rate, trt.rate);
-      const req  = requiredNTotal(ctrl.rate, trt.rate, w1, w2);
-      return { trt, freq, bay, pow, req, w1, w2 };
+      // Use mean/variance from API if present; fall back to rate + Bernoulli variance
+      const cMean = ctrl.mean ?? ctrl.rate;
+      const tMean = trt.mean  ?? trt.rate;
+      const cVar  = ctrl.variance ?? cMean * (1 - cMean);
+      const tVar  = trt.variance  ?? tMean * (1 - tMean);
+      const analysis = runAnalysis(
+        { assigned: ctrl.assigned, mean: cMean, variance: cVar },
+        { assigned: trt.assigned,  mean: tMean, variance: tVar },
+        method,
+      );
+      const sp1 = flag.allocations[0]?.splits?.find(s => s.variant_key === ctrl.variant);
+      const sp2 = flag.allocations[0]?.splits?.find(s => s.variant_key === trt.variant);
+      const w1  = (sp1?.weight ?? 50) / 100, w2 = (sp2?.weight ?? 50) / 100;
+      const pow = computePower(ctrl.assigned, trt.assigned, cMean, tMean);
+      const req = requiredNTotal(cMean, tMean, w1, w2);
+      return { trt, analysis, pow, req, w1, w2 };
     }).filter(Boolean);
   }
 
@@ -638,6 +646,14 @@ function ResultsCard({ flag }) {
               </select>
             : <input className="input" placeholder="metric name" value={metric} onChange={e => setMetric(e.target.value)} style={{ width: 200 }} />
           }
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Analysis method</div>
+          <select className="input" value={method} onChange={e => setMethod(e.target.value)}>
+            <option value="fixed_sample">Fixed-sample</option>
+            <option value="sequential">Sequential</option>
+            <option value="bayesian">Bayesian</option>
+          </select>
         </div>
         <div style={{ alignSelf: 'flex-end' }}>
           <button className="btn btn-primary" onClick={loadResults} disabled={!metric || loading}>
@@ -685,20 +701,43 @@ function ResultsCard({ flag }) {
           </table>
 
           {analyses && analyses.map(a => {
-            const { bg, tx } = verdictStyle(a.freq.pValue, a.pow);
+            const { trt, analysis, pow, req } = a;
+            if (!analysis) return null;
+            const relPct = v => (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
+            const displayLift = analysis.method === 'bayesian' ? analysis.postMean : analysis.lift;
+            const sig = analysis.method === 'bayesian'
+              ? (analysis.probPositive >= 0.95 || analysis.probPositive <= 0.05)
+              : (analysis.lo > 0 || analysis.hi < 0);
+            const powOk = analysis.method !== 'fixed_sample' || pow >= 0.6;
+            const { bg, tx } = sig && powOk ? { bg: '#d4edda', tx: '#155724' }
+                             : sig          ? { bg: '#fff3cd', tx: '#856404' }
+                             :                { bg: '#f8d7da', tx: '#721c24' };
+            const ciLabel = { sequential: 'Anytime-valid 95% CI', bayesian: '95% credible interval' }[analysis.method] ?? '95% CI';
+            const statField = analysis.method === 'bayesian'
+              ? ['P(treatment > control)', pct(analysis.probPositive)]
+              : ['p-value', analysis.pValue != null ? fmt(analysis.pValue, 4) : (sig ? '< α' : '> α')];
+            const verdictMsg = analysis.method === 'bayesian'
+              ? (analysis.probPositive >= 0.95 ? `Treatment better with ${pct(analysis.probPositive)} probability`
+                : analysis.probPositive <= 0.05 ? `Control better — P(T > C) = ${pct(analysis.probPositive)}`
+                : `Inconclusive — P(treatment > control) = ${pct(analysis.probPositive)}`)
+              : analysis.method === 'sequential'
+                ? (sig ? `Anytime-valid result: ${relPct(analysis.lift)} relative lift` : `No conclusion yet — CI contains 0`)
+                : (analysis.pValue < 0.05 && pow < 0.6 ? `Significant but underpowered (p = ${fmt(analysis.pValue,4)})`
+                  : analysis.pValue < 0.05 ? `Statistically significant (p = ${fmt(analysis.pValue,4)})`
+                  : analysis.pValue < 0.1  ? `Marginal (p = ${fmt(analysis.pValue,4)})`
+                  : `Not significant (p = ${fmt(analysis.pValue,4)})`);
             return (
-              <div key={a.trt.variant} style={{ marginBottom: 16 }}>
+              <div key={trt.variant} style={{ marginBottom: 16 }}>
                 <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 13 }}>
-                  <span className="flag-key">{a.trt.variant}</span> vs <span className="flag-key">{results.variants[0].variant}</span>
+                  <span className="flag-key">{trt.variant}</span> vs <span className="flag-key">{results.variants[0].variant}</span>
                 </div>
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
                   {[
-                    ['p-value',              fmt(a.freq.pValue, 4)],
-                    ['95% CI',               `[${pp(a.freq.ci95lo)}, ${pp(a.freq.ci95hi)}]`],
-                    ['P(treatment > ctrl)',   pct(a.bay.probBgtA)],
-                    ['Expected lift',         (a.bay.relLift >= 0 ? '+' : '') + (a.bay.relLift * 100).toFixed(2) + '%'],
-                    ['Power',                 pct(a.pow)],
-                    ['N for 80% power',       a.req.toLocaleString() + ` total`],
+                    ['Relative lift', relPct(displayLift)],
+                    [ciLabel,         `[${relPct(analysis.lo)}, ${relPct(analysis.hi)}]`],
+                    statField,
+                    ['Power',         pct(pow)],
+                    ['N for 80% power', req.toLocaleString() + ' total'],
                   ].map(([label, val]) => (
                     <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '8px 14px', minWidth: 120 }}>
                       <div style={{ fontSize: 11, color: '#888', marginBottom: 3 }}>{label}</div>
@@ -706,11 +745,15 @@ function ResultsCard({ flag }) {
                     </div>
                   ))}
                 </div>
-                <div style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 6, fontWeight: 700, fontSize: 12, background: bg, color: tx }}>
-                  {a.freq.pValue < 0.05
-                    ? a.pow < 0.6 ? `Significant but underpowered — effect may be inflated` : `Statistically significant (p = ${fmt(a.freq.pValue,4)})`
-                    : a.freq.pValue < 0.1 ? `Marginal (p = ${fmt(a.freq.pValue,4)})` : `Not significant (p = ${fmt(a.freq.pValue,4)})`
-                  }
+                <div style={{ display: 'inline-flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 6, fontWeight: 700, fontSize: 12, background: bg, color: tx }}>
+                    {verdictMsg}
+                  </div>
+                  {analysis.method === 'fixed_sample' && pow < 0.8 && (
+                    <div style={{ fontSize: 12, color: '#856404', background: '#fff3cd', padding: '5px 12px', borderRadius: 5 }}>
+                      ⚠ {pct(pow)} power — need {req.toLocaleString()} total for 80%
+                    </div>
+                  )}
                 </div>
               </div>
             );
@@ -1305,6 +1348,98 @@ function erf(x) {
 
 function normalCDF(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
 
+// Inverse normal CDF (probit) — Acklam rational approximation, max error ~1.15e-9
+function probit(p) {
+  const a = [-3.969683028665376e+01,  2.209460984245205e+02, -2.759285104469687e+02,
+              1.383577518672690e+02, -3.066479806614716e+01,  2.506628277459239e+00];
+  const b = [-5.447609879822406e+01,  1.615858368580409e+02, -1.556989798598866e+02,
+              6.680131188771972e+01, -1.328068155288572e+01];
+  const c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+             -2.549732539343734e+00,  4.374664141464968e+00,  2.938163982698783e+00];
+  const d = [ 7.784695709041462e-03,  3.224671290700398e-01,  2.445134137142996e+00,
+              3.754408661907416e+00];
+  if (p <= 0) return -Infinity;
+  if (p >= 1) return  Infinity;
+  const pLow = 0.02425, pHigh = 1 - pLow;
+  let q, r;
+  if (p < pLow) {
+    q = Math.sqrt(-2 * Math.log(p));
+    return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+           ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+  }
+  if (p <= pHigh) {
+    q = p - 0.5; r = q * q;
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q /
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1);
+  }
+  q = Math.sqrt(-2 * Math.log(1 - p));
+  return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+           ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+}
+
+// ---------------------------------------------------------------------------
+// Eppo-style analysis methods
+//
+// All three methods operate on relative lift Δ = (μT − μC) / μC and use the
+// delta method to propagate variance. Inputs for each variant:
+//   { assigned: n, mean: per-user mean (incl. zeros), variance: sample var }
+// ---------------------------------------------------------------------------
+
+// Relative lift and standard error via the delta method (Eppo's formula).
+function deltaMethodLift(nC, mC, vC, nT, mT, vT) {
+  if (!mC) return { lift: 0, sigmaDelta: Infinity };
+  const lift     = (mT - mC) / mC;
+  // σ²_Δ = (mT/mC)² × (vC/(nC·mC²) + vT/(nT·mT²))
+  const varDelta = (mT / mC) ** 2 * (vC / (nC * mC ** 2) + (mT ? vT / (nT * mT ** 2) : 0));
+  return { lift, sigmaDelta: Math.sqrt(Math.max(0, varDelta)) };
+}
+
+// Fixed-sample frequentist CI. Two-sided z-test on relative lift.
+function fixedSampleCI(lift, sigmaDelta, alpha = 0.05) {
+  if (!sigmaDelta || !isFinite(sigmaDelta)) return null;
+  const z      = -probit(alpha / 2); // e.g. 1.96 for α=0.05
+  const pValue = 2 * normalCDF(-Math.abs(lift / sigmaDelta));
+  return { lo: lift - z * sigmaDelta, hi: lift + z * sigmaDelta, pValue, method: 'fixed_sample' };
+}
+
+// Sequential CI — Howard et al. time-uniform confidence sequence (Eppo's formula).
+// t = nC + nT, ρ tuned with N_tune = 10,000.
+function sequentialCI(lift, sigmaDelta, t, alpha = 0.05) {
+  if (!sigmaDelta || !isFinite(sigmaDelta) || t < 2) return null;
+  const rho = 10000 / (Math.log(Math.log(Math.E / alpha ** 2)) - 2 * Math.log(alpha));
+  const B   = Math.sqrt((t + rho) * Math.log((t + rho) / (rho * alpha ** 2))) / Math.sqrt(t);
+  return { lo: lift - B * sigmaDelta, hi: lift + B * sigmaDelta, B, method: 'sequential' };
+}
+
+// Bayesian CI — Gaussian prior N(0, σ²=0.05²) on relative lift (Eppo's prior).
+// Posterior is weighted average of prior and likelihood.
+function bayesianGaussianCI(lift, sigmaDelta, alpha = 0.05) {
+  if (!sigmaDelta || !isFinite(sigmaDelta)) return null;
+  const precPrior    = 1 / 0.05 ** 2;            // prior N(0, 0.05²): precision = 400
+  const precData     = 1 / sigmaDelta ** 2;
+  const postMean     = precData * lift / (precPrior + precData); // prior mean = 0
+  const postSigma    = Math.sqrt(1 / (precPrior + precData));
+  const z            = -probit(alpha / 2);
+  const probPositive = normalCDF(postMean / postSigma);
+  return { lo: postMean - z * postSigma, hi: postMean + z * postSigma,
+           postMean, postSigma, probPositive, method: 'bayesian' };
+}
+
+// Unified entry point. ctrl/trt: { assigned, mean, variance }
+// method: 'fixed_sample' | 'sequential' | 'bayesian'
+function runAnalysis(ctrl, trt, method = 'fixed_sample', alpha = 0.05) {
+  const { lift, sigmaDelta } = deltaMethodLift(
+    ctrl.assigned, ctrl.mean, ctrl.variance,
+    trt.assigned,  trt.mean,  trt.variance,
+  );
+  const t = ctrl.assigned + trt.assigned;
+  switch (method) {
+    case 'sequential': return { lift, sigmaDelta, ...sequentialCI(lift, sigmaDelta, t, alpha) };
+    case 'bayesian':   return { lift, sigmaDelta, ...bayesianGaussianCI(lift, sigmaDelta, alpha) };
+    default:           return { lift, sigmaDelta, ...fixedSampleCI(lift, sigmaDelta, alpha) };
+  }
+}
+
 // Two-proportion z-test (two-sided). Returns { z, pValue, diff, ci95lo, ci95hi }
 function zTestProportions(n1, x1, n2, x2) {
   const p1 = x1 / n1, p2 = x2 / n2;
@@ -1377,6 +1512,7 @@ function SimulateView() {
   const [flagId,     setFlagId]     = useState('');
   const [flag,       setFlag]       = useState(null);
   const [nUsers,     setNUsers]     = useState(1000);
+  const [method,     setMethod]     = useState('fixed_sample');
   const [varCfg,     setVarCfg]     = useState({});   // { variantKey: { rate: string } }
   const [results,    setResults]    = useState(null);
   const [seed,       setSeed]       = useState(() => Math.floor(Math.random() * 1e9));
@@ -1437,34 +1573,31 @@ function SimulateView() {
       const n1 = counts[controlKey], x1 = conversions[controlKey];
       const n2 = counts[v.key],      x2 = conversions[v.key];
       if (!n1 || !n2) continue;
+      const m1 = x1 / n1, m2 = x2 / n2; // observed rates
       const p1true = parseFloat(varCfg[controlKey]?.rate ?? 0.1);
       const p2true = parseFloat(varCfg[v.key]?.rate    ?? 0.1);
-      // Extract fractional weights from the allocation splits for this pair
       const sp1 = splits.find(s => s.variant_key === controlKey);
       const sp2 = splits.find(s => s.variant_key === v.key);
       const w1  = (sp1?.weight ?? 50) / 100;
       const w2  = (sp2?.weight ?? 50) / 100;
-      const t   = zTestProportions(n1, x1, n2, x2);
+      // Bernoulli variance for binary simulation data
+      const analysis = runAnalysis(
+        { assigned: n1, mean: m1, variance: m1 * (1 - m1) },
+        { assigned: n2, mean: m2, variance: m2 * (1 - m2) },
+        method,
+      );
       const pow = computePower(n1, n2, p1true, p2true);
       const req = requiredNTotal(p1true, p2true, w1, w2);
-      const bay = bayesianTest(n1, x1, n2, x2);
-      tests.push({ variantKey: v.key, ...t, power: pow, requiredNTotal: req, w1, w2, bay });
+      tests.push({ variantKey: v.key, analysis, power: pow, requiredNTotal: req, w1, w2 });
     }
 
     setResults({ counts, conversions, tests, controlKey });
   }
 
-  // Verdict combines significance AND power.
-  // Significant + underpowered = "winner's curse" risk — show amber, not green.
-  function verdictStyle(pValue, power) {
-    if (pValue < 0.05 && power >= 0.6) return { bg: '#d4edda', tx: '#155724' }; // green — significant & adequately powered
-    if (pValue < 0.05 && power <  0.6) return { bg: '#fff3cd', tx: '#856404' }; // amber — significant but underpowered
-    if (pValue < 0.1)                  return { bg: '#fff3cd', tx: '#856404' }; // amber — marginal
-    return                                    { bg: '#f8d7da', tx: '#721c24' }; // red   — not significant
-  }
   function pct(n)    { return (n * 100).toFixed(2) + '%'; }
   function fmt(n, d=3) { return n.toFixed(d); }
   function pp(n)     { return (n >= 0 ? '+' : '') + (n*100).toFixed(2) + 'pp'; }
+  function relPct(n) { return (n >= 0 ? '+' : '') + (n*100).toFixed(2) + '%'; }
 
   const hasVariants = flag?.variants?.length > 0;
   const hasAlloc    = flag?.allocations?.length > 0;
@@ -1494,6 +1627,14 @@ function SimulateView() {
                 onChange={e => setSeed(Number(e.target.value))} style={{ width: 110 }} />
               <button className="btn btn-sm" onClick={() => { setSeed(Math.floor(Math.random()*1e9)); setResults(null); }}>↺</button>
             </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Analysis method</div>
+            <select className="input" value={method} onChange={e => setMethod(e.target.value)}>
+              <option value="fixed_sample">Fixed-sample</option>
+              <option value="sequential">Sequential</option>
+              <option value="bayesian">Bayesian</option>
+            </select>
           </div>
         </div>
 
@@ -1586,81 +1727,41 @@ function SimulateView() {
           </div>
 
           <div className="card">
-            <h2 style={{ marginBottom: 2 }}>Frequentist — Two-proportion z-test</h2>
+            <h2 style={{ marginBottom: 2 }}>Statistical Analysis
+              <span style={{ fontWeight: 400, fontSize: 13, color: '#666', marginLeft: 10 }}>
+                {{ fixed_sample: 'Fixed-sample · δ-method CI on relative lift', sequential: 'Sequential · Howard et al. anytime-valid CI', bayesian: 'Bayesian · Gaussian prior N(0, 0.05²) on lift' }[method]}
+              </span>
+            </h2>
             <div className="muted" style={{ marginBottom: 16, fontSize: 12 }}>
-              Two-sided, α = 0.05. Each treatment arm vs. control. Answers: "is the observed difference unlikely under the null hypothesis?"
-            </div>
-            {results.tests.length === 0
-              ? <div className="muted">No treatment arms to test.</div>
-              : results.tests.map(t => (
-                <div key={t.variantKey} style={{ marginBottom: 20 }}>
-                  <div style={{ fontWeight: 600, marginBottom: 10 }}>
-                    <span className="flag-key">{t.variantKey}</span> vs <span className="flag-key">{results.controlKey}</span>
-                  </div>
-                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
-                    {[
-                      ['z-statistic',     fmt(t.z)],
-                      ['p-value',         fmt(t.pValue, 4)],
-                      ['Observed diff',   pp(t.diff)],
-                      ['95% CI',          `[${pp(t.ci95lo)}, ${pp(t.ci95hi)}]`],
-                      ['Power (this N)',   pct(t.power)],
-                      ['N for 80% power', t.requiredNTotal.toLocaleString() + ` total (${Math.round(t.w1*100)}/${Math.round(t.w2*100)} split)`],
-                    ].map(([label, val]) => (
-                      <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '10px 16px', minWidth: 130 }}>
-                        <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>{label}</div>
-                        <div style={{ fontFamily: 'monospace', fontWeight: 600 }}>{val}</div>
-                      </div>
-                    ))}
-                  </div>
-                  {(() => {
-                    const { bg, tx } = verdictStyle(t.pValue, t.power);
-                    const sigText = t.pValue < 0.05
-                      ? t.power < 0.6
-                        ? `Significant but underpowered (p = ${fmt(t.pValue,4)}) — effect size likely inflated`
-                        : `Statistically significant (p = ${fmt(t.pValue,4)})`
-                      : t.pValue < 0.1
-                        ? `Marginal (p = ${fmt(t.pValue,4)}) — not significant at α = 0.05`
-                        : `Not significant (p = ${fmt(t.pValue,4)})`;
-                    return (
-                      <div style={{ display: 'inline-block', padding: '6px 14px', borderRadius: 6, fontWeight: 700, fontSize: 13, background: bg, color: tx }}>
-                        {sigText}
-                      </div>
-                    );
-                  })()}
-                  {t.power < 0.6 && (
-                    <div style={{ marginTop: 8, fontSize: 12, color: '#856404', background: '#fff3cd', padding: '6px 12px', borderRadius: 5, display: 'block', maxWidth: 560, lineHeight: 1.5 }}>
-                      ⚠ Only {pct(t.power)} power — this experiment is underpowered. {t.pValue < 0.05 ? 'The significant result is likely a winner\'s curse: sampling noise inflated the observed effect. ' : ''}Need {t.requiredNTotal.toLocaleString()} total users for 80% power at this {Math.round(t.w1*100)}/{Math.round(t.w2*100)} split.
-                    </div>
-                  )}
-                  {t.power >= 0.6 && t.power < 0.8 && (
-                    <div style={{ marginTop: 8, fontSize: 12, color: '#856404', background: '#fff3cd', padding: '6px 12px', borderRadius: 5, display: 'inline-block' }}>
-                      ⚠ {pct(t.power)} power — below 80% target. Need {t.requiredNTotal.toLocaleString()} total users at this {Math.round(t.w1*100)}/{Math.round(t.w2*100)} split.
-                    </div>
-                  )}
-                </div>
-              ))
-            }
-          </div>
-
-          <div className="card">
-            <h2 style={{ marginBottom: 2 }}>Bayesian — Beta-Binomial</h2>
-            <div className="muted" style={{ marginBottom: 16, fontSize: 12 }}>
-              Uninformative Beta(1,1) prior. Answers: "given the data, what is the probability treatment is better than control?"
+              Relative lift = (treatment − control) / control. Each treatment arm vs. control. α = 0.05.
             </div>
             {results.tests.length === 0
               ? <div className="muted">No treatment arms to test.</div>
               : results.tests.map(t => {
-                const b = t.bay;
-                const probPct = pct(b.probBgtA);
-                const isWinner = b.probBgtA >= 0.95;
-                const isLoser  = b.probBgtA <= 0.05;
-                const bgColor  = isWinner ? '#d4edda' : isLoser ? '#f8d7da' : '#fff3cd';
-                const txColor  = isWinner ? '#155724' : isLoser ? '#721c24' : '#856404';
-                const verdict  = isWinner
-                  ? `Treatment is better with ${probPct} probability`
-                  : isLoser
-                    ? `Control is better (treatment win prob = ${probPct})`
-                    : `Inconclusive — treatment win probability ${probPct}`;
+                const { analysis, power, requiredNTotal, w1, w2 } = t;
+                if (!analysis) return null;
+                const displayLift = analysis.method === 'bayesian' ? analysis.postMean : analysis.lift;
+                const sig = analysis.method === 'bayesian'
+                  ? (analysis.probPositive >= 0.95 || analysis.probPositive <= 0.05)
+                  : (analysis.lo > 0 || analysis.hi < 0);
+                const powOk = analysis.method !== 'fixed_sample' || power >= 0.6;
+                const { bg, tx } = sig && powOk ? { bg: '#d4edda', tx: '#155724' }
+                                 : sig          ? { bg: '#fff3cd', tx: '#856404' }
+                                 :                { bg: '#f8d7da', tx: '#721c24' };
+                const ciLabel = { sequential: 'Anytime-valid 95% CI', bayesian: '95% credible interval' }[analysis.method] ?? '95% CI';
+                const statField = analysis.method === 'bayesian'
+                  ? ['P(treatment > control)', pct(analysis.probPositive)]
+                  : ['p-value', analysis.pValue != null ? fmt(analysis.pValue, 4) : (sig ? '< α' : '> α')];
+                const verdictMsg = analysis.method === 'bayesian'
+                  ? (analysis.probPositive >= 0.95 ? `Treatment better with ${pct(analysis.probPositive)} probability`
+                    : analysis.probPositive <= 0.05 ? `Control better — P(T > C) = ${pct(analysis.probPositive)}`
+                    : `Inconclusive — P(treatment > control) = ${pct(analysis.probPositive)}`)
+                  : analysis.method === 'sequential'
+                    ? (sig ? `Anytime-valid result: ${relPct(analysis.lift)} relative lift` : `No conclusion yet — CI contains 0`)
+                    : (analysis.pValue < 0.05 && power < 0.6 ? `Significant but underpowered (p = ${fmt(analysis.pValue,4)})`
+                      : analysis.pValue < 0.05 ? `Statistically significant (p = ${fmt(analysis.pValue,4)})`
+                      : analysis.pValue < 0.1  ? `Marginal (p = ${fmt(analysis.pValue,4)})`
+                      : `Not significant (p = ${fmt(analysis.pValue,4)})`);
                 return (
                   <div key={t.variantKey} style={{ marginBottom: 20 }}>
                     <div style={{ fontWeight: 600, marginBottom: 10 }}>
@@ -1668,11 +1769,11 @@ function SimulateView() {
                     </div>
                     <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
                       {[
-                        ['P(treatment > control)', probPct],
-                        ['Posterior rate — control',   pct(b.posteriorMeanA)],
-                        ['Posterior rate — treatment', pct(b.posteriorMeanB)],
-                        ['Expected lift',   (b.relLift >= 0 ? '+' : '') + (b.relLift * 100).toFixed(2) + '%'],
-                        ['95% credible interval', `[${pp(b.credLo)}, ${pp(b.credHi)}]`],
+                        ['Relative lift', relPct(displayLift)],
+                        [ciLabel,         `[${relPct(analysis.lo)}, ${relPct(analysis.hi)}]`],
+                        statField,
+                        ['Power (this N)',   pct(power)],
+                        ['N for 80% power', requiredNTotal.toLocaleString() + ` total (${Math.round(w1*100)}/${Math.round(w2*100)} split)`],
                       ].map(([label, val]) => (
                         <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '10px 16px', minWidth: 130 }}>
                           <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>{label}</div>
@@ -1680,12 +1781,15 @@ function SimulateView() {
                         </div>
                       ))}
                     </div>
-                    <div style={{ display: 'inline-block', padding: '6px 14px', borderRadius: 6, fontWeight: 700, fontSize: 13, background: bgColor, color: txColor }}>
-                      {verdict}
-                    </div>
-                    <div style={{ marginTop: 10, fontSize: 12, color: '#555', maxWidth: 620, lineHeight: 1.5 }}>
-                      The posterior is updated from the observed data. Unlike the p-value, this probability can be read directly:
-                      there is a {probPct} chance treatment converts better than control, given what we observed.
+                    <div style={{ display: 'inline-flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <div style={{ display: 'inline-block', padding: '6px 14px', borderRadius: 6, fontWeight: 700, fontSize: 13, background: bg, color: tx }}>
+                        {verdictMsg}
+                      </div>
+                      {analysis.method === 'fixed_sample' && power < 0.8 && (
+                        <div style={{ fontSize: 12, color: '#856404', background: '#fff3cd', padding: '6px 12px', borderRadius: 5 }}>
+                          ⚠ {pct(power)} power — need {requiredNTotal.toLocaleString()} total for 80% at {Math.round(w1*100)}/{Math.round(w2*100)} split
+                        </div>
+                      )}
                     </div>
                   </div>
                 );

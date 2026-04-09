@@ -104,14 +104,16 @@ export default async function metricsRoutes(app) {
     const sinceTs = since ?? flag.started_at ?? null;
     const whereTime = sinceTs ? `AND a.assigned_at >= '${sinceTs.replace(/'/g, '')}'` : '';
 
-    // Per-variant stats from the join
+    // Per-variant stats from the join.
+    // sum_sq_value = Σ (per-user total)² across converters; used to compute
+    // sample variance that includes non-converters (who contribute 0).
     const rows = await db.all(
       `SELECT
          a.variant,
          COUNT(DISTINCT a.user_id)                              AS assigned,
          COUNT(DISTINCT e.user_id)                             AS converted,
-         COALESCE(SUM(e.value), 0)                             AS total_value,
-         COALESCE(AVG(e.agg_value), 0)                         AS mean_value
+         COALESCE(SUM(e.agg_value), 0)                         AS total_value,
+         COALESCE(SUM(e.agg_value * e.agg_value), 0)           AS sum_sq_value
        FROM experiment_assignments a
        LEFT JOIN (
          SELECT user_id, flag_key, SUM(value) AS agg_value
@@ -128,14 +130,24 @@ export default async function metricsRoutes(app) {
       flag_key:    flagKey,
       metric_name: metricName,
       since:       sinceTs,
-      variants:    rows.map(r => ({
-        variant:    r.variant,
-        assigned:   r.assigned,
-        converted:  r.converted,
-        rate:       r.assigned > 0 ? Math.round((r.converted / r.assigned) * 10000) / 10000 : 0,
-        mean_value: Math.round(r.mean_value * 10000) / 10000,
-        total_value: r.total_value,
-      })),
+      variants:    rows.map(r => {
+        const n    = r.assigned;
+        const mean = n > 0 ? r.total_value / n : 0;
+        // Bessel-corrected sample variance across all assigned users (non-converters = 0)
+        // Var = (ΣX² / n − mean²) × n/(n−1)
+        const variance = n > 1
+          ? (r.sum_sq_value / n - mean * mean) * (n / (n - 1))
+          : mean * (1 - mean); // fallback for n ≤ 1
+        return {
+          variant:     r.variant,
+          assigned:    n,
+          converted:   r.converted,
+          rate:        n > 0 ? Math.round((r.converted / n) * 10000) / 10000 : 0,
+          mean:        Math.round(mean     * 1e6) / 1e6,
+          variance:    Math.round(variance * 1e6) / 1e6,
+          total_value: r.total_value,
+        };
+      }),
     };
   });
 }
