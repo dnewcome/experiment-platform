@@ -48,22 +48,47 @@ if (!dsExists) {
 // Query helper
 // ---------------------------------------------------------------------------
 
-// BigQuery cannot infer types for null parameters. Replace every ? that maps
-// to a null/undefined value with the SQL NULL literal so no type hint is needed.
-function inlineNulls(sql, params) {
-  const kept = [];
-  let i = 0;
-  const out = sql.replace(/\?/g, () => {
-    const v = params[i++];
-    if (v === null || v === undefined) return 'NULL';
-    kept.push(v);
-    return '?';
+// INT64 column names in this schema. String params that look like integers are
+// coerced to Number when the SQL shows they target one of these columns.
+// This is needed because route params (req.params.id etc.) are always strings,
+// but BigQuery won't implicitly coerce STRING to INT64 in comparisons.
+const INT64_COLUMNS = new Set(['id', 'flag_id', 'allocation_id', 'bucket', 'priority', 'enabled']);
+
+// Single-pass param preparation:
+//   - null/undefined → inline SQL NULL literal (BigQuery can't type-infer nulls)
+//   - string integer for an INT64 column → Number (BigQuery strict typing)
+function prepareParams(sql, params) {
+  if (!params.length) return { sql, params };
+  const segments = sql.split('?');
+  let outSql = '';
+  const outParams = [];
+
+  params.forEach((v, i) => {
+    const seg = segments[i];
+
+    if (v === null || v === undefined) {
+      outSql += seg + 'NULL';
+      return;
+    }
+
+    if (typeof v === 'string' && /^\d+$/.test(v)) {
+      // Check the column name immediately before this ? (handles col = ? patterns)
+      const m = seg.match(/\b(\w+)\s*=\s*$/i);
+      if (m && INT64_COLUMNS.has(m[1].toLowerCase())) {
+        v = Number(v);
+      }
+    }
+
+    outSql += seg + '?';
+    outParams.push(v);
   });
-  return { sql: out, params: kept };
+
+  outSql += segments[params.length];
+  return { sql: outSql, params: outParams };
 }
 
 async function runQuery(sql, params = []) {
-  const { sql: finalSql, params: finalParams } = inlineNulls(sql, params);
+  const { sql: finalSql, params: finalParams } = prepareParams(sql, params);
   const options = {
     query: finalSql,
     defaultDataset: { datasetId, projectId },
