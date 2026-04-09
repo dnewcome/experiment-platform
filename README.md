@@ -5,33 +5,35 @@ A self-hosted feature flagging and experimentation platform. Designed as a repla
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Browser UI (React, no build step)                  │
-│  Flags · Evaluate · Assignments · Simulate          │
-└─────────────────────┬───────────────────────────────┘
-                      │ HTTP
-┌─────────────────────▼───────────────────────────────┐  ┌──────────────────────────┐
-│  Fastify API                                        │  │  Node.js SDK             │
-│  /api/flags        /api/sdk/config                  │  │  sdk/index.js            │
-│  /api/evaluate     /api/assignments                 │  │                          │
-└─────────────────────┬───────────────────────────────┘  │  polls /api/sdk/config   │
-                      │                 ▲                 │  evaluates locally       │
-┌─────────────────────▼───────────────┐ │                 │  logs via POST           │
-│  lib/evaluate.js (shared core)      │─┘                 │  /api/assignments        │
-│  getBucket · parseValue             │◄──────────────────┘
-│  evaluateFlag                       │
-└─────────────────────┬───────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────┐
-│  SQLite (better-sqlite3, WAL mode)                  │
-│  flags · variants · allocations                     │
-│  experiment_assignments                             │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Browser UI (React, no build step)                               │
+│  Flags · Evaluate · Assignments · Simulate · Warehouse           │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │ HTTP (+ Bearer token if API_KEY set)
+┌──────────────────────────▼───────────────────────────────────────┐  ┌──────────────────────────────────┐
+│  Fastify API                                                     │  │  Node.js SDK  sdk/index.js       │
+│  /api/flags          /api/sdk/config                             │  │                                  │
+│  /api/evaluate       /api/assignments                            │  │  polls /api/sdk/config (60s)     │
+│  /api/srm/:flagKey   /api/metrics/*                              │  │  evaluates locally               │
+│  /api/analysis/*                                                 │  │  logs via POST /api/assignments  │
+└──────────────────────────┬───────────────────────────────────────┘  │  tracks via POST /api/metrics    │
+                           │                  ▲                        └──────────────────────────────────┘
+┌──────────────────────────▼────────────────┐ │
+│  lib/evaluate.js (shared core)            │─┘
+│  getBucket · parseValue · evaluateFlag    │
+└──────────────────────────┬────────────────┘
+                           │
+┌──────────────────────────▼───────────────────────────────────────┐
+│  db/index.js — adapter selector                                  │
+│                                                                  │
+│  SQLite (default)   Postgres              BigQuery               │
+│  flags.db           DATABASE_URL=...      BIGQUERY_KEYFILE=...   │
+│  better-sqlite3     pg pool               @google-cloud/bigquery │
+│  WAL mode                                                        │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 **No build step.** The frontend is plain React loaded via UMD scripts + Babel standalone. Edit `public/app.js`, refresh the browser.
-
-**No external services.** Everything runs on one Node.js process against a local SQLite file. The database is production-ready for moderate traffic (WAL mode, indexed assignment log, prepared statements).
 
 ## Getting Started
 
@@ -42,6 +44,53 @@ npm run dev        # starts on http://localhost:3000
 ```
 
 Delete `flags.db` and restart to reset all data.
+
+**Optional authentication:** set the `API_KEY` environment variable to require a Bearer token on all `/api` requests:
+
+```sh
+API_KEY=my-secret npm run dev
+```
+
+## Database Adapters
+
+The platform supports three database backends. Set the appropriate environment variables before starting the server; the adapter is selected automatically.
+
+### SQLite (default)
+
+No configuration needed. Uses `flags.db` in the project root (WAL mode, indexed assignment log, prepared statements). Recommended for local development and single-machine deployments.
+
+```sh
+npm start
+```
+
+Delete `flags.db` to reset all data.
+
+### Postgres
+
+```sh
+DATABASE_URL=postgres://user:pass@host:5432/dbname npm start
+```
+
+Schema is created on startup via `CREATE TABLE IF NOT EXISTS`. Migrations (new columns) are applied automatically on the next start.
+
+### BigQuery
+
+```sh
+BIGQUERY_KEYFILE=/path/to/service-account.json npm start
+
+# Optional overrides:
+BIGQUERY_PROJECT=my-gcp-project   # defaults to project_id in keyfile
+BIGQUERY_DATASET=experiment_data  # defaults to experiment_platform
+BIGQUERY_LOCATION=US              # defaults to US
+```
+
+The service account needs **BigQuery Data Editor** and **BigQuery Job User** IAM roles. The dataset and all tables are created on startup if they don't exist.
+
+The BigQuery adapter handles:
+- **No AUTOINCREMENT**: row IDs are generated via `crypto.randomInt`
+- **Strict typing**: route string params are coerced to INT64 for known ID columns
+- **No DEFAULT expressions**: column defaults are injected per-INSERT in the adapter
+- **No real transactions**: operations run sequentially without rollback
 
 ## Concepts
 
@@ -88,13 +137,36 @@ Rules are built visually in the UI and stored as [JSON Logic](https://jsonlogic.
 | `>` `>=` `<` `<=` | number | `account_age_days >= 30` |
 | `contains` / `not_contains` | text | `email contains "@acme"` |
 | `starts_with` | text | `plan starts_with "ent"` |
-| `in` | text | `country in "US, CA, GB"` |
+| `in` / `not_in` | text | `country in "US, CA, GB"` |
 
 Groups can be nested to any depth with AND/OR combinators.
+
+### Experiment Lifecycle
+
+Flags have a `status` field that controls the experiment state machine:
+
+```
+draft ──► running ──► stopped
+  ▲                      │
+  └──────────────────────┘  (reset)
+```
+
+| Status | Meaning |
+|---|---|
+| `draft` | Flag is being configured. Variants and allocations can be freely edited. |
+| `running` | Experiment is live. `started_at` is recorded. Variants and allocations are **locked** — edits are rejected with 409 to prevent mid-experiment config drift. |
+| `stopped` | Experiment has ended. Results are preserved. Can be reset back to draft to reconfigure and re-run. |
+
+Use `PUT /api/flags/:id/status` to transition between states. The UI shows a lifecycle bar with Start / Stop / Restart / Reset buttons and locks all editing controls while the experiment is running.
 
 ## API
 
 All endpoints are under `/api`. Request and response bodies are JSON.
+
+If `API_KEY` is set on the server, all `/api` requests must include:
+```
+Authorization: Bearer <key>
+```
 
 ### Flags
 
@@ -104,6 +176,7 @@ POST   /api/flags                    create a flag
 GET    /api/flags/:id                get flag with variants + allocations
 PUT    /api/flags/:id                update flag (name, enabled, fields, type)
 DELETE /api/flags/:id                delete flag and all its data
+PUT    /api/flags/:id/status         transition experiment status
 ```
 
 **Create flag:**
@@ -112,12 +185,22 @@ POST /api/flags
 { "key": "new-checkout", "name": "New Checkout Flow", "type": "boolean" }
 ```
 
+**Transition status:**
+```json
+PUT /api/flags/1/status
+{ "status": "running" }
+```
+
+Valid transitions: `draft → running`, `running → stopped`, `stopped → draft` (reset).
+
 ### Variants
 
 ```
 POST   /api/flags/:id/variants             add a variant
 DELETE /api/flags/:flagId/variants/:id     remove a variant
 ```
+
+Rejected with 409 if the flag is `running`.
 
 **Add variant:**
 ```json
@@ -132,6 +215,8 @@ POST   /api/flags/:id/allocations             add an allocation
 PUT    /api/flags/:flagId/allocations/:id     update an allocation
 DELETE /api/flags/:flagId/allocations/:id     remove an allocation
 ```
+
+Rejected with 409 if the flag is `running`.
 
 **Add allocation (50/50 split, US enterprise users only):**
 ```json
@@ -197,7 +282,170 @@ Every evaluation is logged to `experiment_assignments`.
 
 ```
 GET    /api/assignments?flag_key=&limit=200&offset=0    paginated log
+POST   /api/assignments                                  log a pre-computed assignment (SDK)
 DELETE /api/assignments                                  clear all records
+```
+
+`POST /api/assignments` is the endpoint used by the SDK's `logAssignment()`. It records a pre-computed assignment without re-evaluating the flag — useful when evaluation happened client-side and you're shipping the result back to be logged.
+
+### SRM Detection
+
+```
+GET /api/srm/:flagKey?since=<ISO timestamp>
+```
+
+Runs a chi-squared goodness-of-fit test to detect Sample Ratio Mismatch (SRM). Returns the observed assignment counts per variant, the expected counts based on split weights, the χ² statistic, degrees of freedom, and a p-value. A p-value below 0.05 means the traffic split is significantly different from what the split weights imply — this usually indicates a bug in the assignment pipeline, not a real effect.
+
+```json
+{
+  "flag_key": "new-checkout",
+  "since": "2024-03-01T00:00:00Z",
+  "srm": false,
+  "p_value": 0.62,
+  "chi2": 0.24,
+  "df": 1,
+  "variants": [
+    { "variant": "control",   "observed": 502, "expected": 500 },
+    { "variant": "treatment", "observed": 498, "expected": 500 }
+  ]
+}
+```
+
+The UI shows the SRM widget on the flag detail page whenever the experiment is running or stopped.
+
+### Metrics
+
+Metrics use a **facts table** model: you ingest raw events, and the server joins them with assignment records to compute per-variant results.
+
+#### Ingestion
+
+```
+POST   /api/metrics/events              record a single event
+POST   /api/metrics/events/bulk         batch ingest (for dbt pipelines)
+DELETE /api/metrics/events?flag_key=&metric_name=   clear for re-ingestion
+```
+
+**Single event:**
+```json
+POST /api/metrics/events
+{
+  "flag_key":    "new-checkout",
+  "user_id":     "user-abc123",
+  "metric_name": "conversion",
+  "value":       1,
+  "event_at":    "2024-03-15T10:30:00Z"
+}
+```
+
+`value` defaults to 1 (binary conversion). Use a numeric value for continuous metrics like revenue. `event_at` defaults to `NOW()` if omitted.
+
+**Bulk ingest (dbt pipeline pattern):**
+```json
+POST /api/metrics/events/bulk
+{
+  "flag_key":    "new-checkout",
+  "metric_name": "conversion",
+  "events": [
+    { "user_id": "user-001", "value": 1, "event_at": "2024-03-15T10:00:00Z" },
+    { "user_id": "user-002", "value": 0 },
+    { "user_id": "user-003", "value": 1 }
+  ]
+}
+```
+
+`flag_key` and `metric_name` at the top level are used as defaults per event; events can override them individually. Designed to be called directly after a dbt run.
+
+#### Discovery
+
+```
+GET /api/metrics/names?flag_key=<key>
+```
+
+Returns distinct metric names with event counts for a flag.
+
+#### Results
+
+```
+GET /api/metrics/results/:flagKey?metric=<name>&since=<ISO timestamp>
+```
+
+Runs the core facts-table join:
+
+```sql
+metric_events JOIN experiment_assignments ON user_id
+WHERE event_at >= assignment.assigned_at   -- post-assignment events only
+  AND reason = 'allocated'                 -- excludes flag_disabled, no_match, etc.
+  AND assigned_at >= <since>               -- defaults to flag's started_at
+GROUP BY variant
+```
+
+Per-variant stats include `mean` (total metric value / assigned users, including non-converters as 0) and `variance` (Bessel-corrected sample variance across all assigned users). These feed directly into the delta-method CI calculations.
+
+**Response:**
+```json
+{
+  "flag_key": "new-checkout",
+  "metric_name": "conversion",
+  "since": "2024-03-01T00:00:00Z",
+  "variants": [
+    {
+      "variant":     "control",
+      "assigned":    502,
+      "converted":   201,
+      "rate":        0.4004,
+      "mean":        0.4004,
+      "variance":    0.2402,
+      "total_value": 201
+    }
+  ]
+}
+```
+
+### Warehouse Analysis
+
+The warehouse analysis API lets you run analysis directly against your data warehouse using SQL snippets — decoupling the statistical engine from how and where your experiment data is stored. This runs through the active database adapter, so with BigQuery configured the SQL executes directly against BigQuery.
+
+#### Run analysis
+
+```
+POST /api/analysis/run
+```
+
+```json
+{
+  "assignment_sql": "SELECT user_id AS entity_id, variant_key AS variant, assigned_at FROM `myproject.dataset.assignments` WHERE experiment_key = 'my-flag'",
+  "metric_sql":     "SELECT user_id AS entity_id, 1 AS value, converted_at AS event_at FROM `myproject.dataset.conversions`",
+  "metric_name":    "conversion"
+}
+```
+
+**SQL contracts:**
+- `assignment_sql` must return: `entity_id`, `variant`, `assigned_at`
+- `metric_sql` must return: `entity_id`, `value`, `event_at` (`event_at` may be NULL to include all events)
+
+The server composes these into a single CTE that joins on `entity_id`, filters metric events to `event_at >= assigned_at`, aggregates per user, then per variant. Write SQL in the dialect of your configured database.
+
+**Response:** same shape as `/api/metrics/results` — per-variant `assigned`, `converted`, `rate`, `mean`, `variance`, `total_value`.
+
+#### Saved configs
+
+```
+GET    /api/analysis/configs           list saved configs
+POST   /api/analysis/configs           save a config
+PUT    /api/analysis/configs/:id       update a config
+DELETE /api/analysis/configs/:id       delete a config
+```
+
+**Config shape:**
+```json
+{
+  "name": "Checkout experiment — conversion",
+  "assignment_sql": "SELECT ...",
+  "metrics": [
+    { "name": "conversion", "sql": "SELECT ..." },
+    { "name": "revenue",    "sql": "SELECT ..." }
+  ]
+}
 ```
 
 ## Data Model
@@ -205,7 +453,9 @@ DELETE /api/assignments                                  clear all records
 ```sql
 flags (
   id, key, name, description, type,
-  enabled, fields, created_at
+  enabled, fields, created_at,
+  status TEXT NOT NULL DEFAULT 'draft',   -- 'draft' | 'running' | 'stopped'
+  started_at TEXT                         -- ISO timestamp; set when status → 'running'
 )
 
 variants (
@@ -224,6 +474,19 @@ experiment_assignments (
   reason, bucket, allocation_id, attributes,
   assigned_at
 )
+
+metric_events (
+  id, flag_key, user_id, metric_name,
+  value REAL,       -- 1 for binary conversions; revenue amount for continuous metrics
+  event_at TEXT     -- ISO timestamp; defaults to NOW() on insert
+)
+
+warehouse_configs (
+  id, name,
+  assignment_sql TEXT,  -- SQL returning entity_id, variant, assigned_at
+  metrics        TEXT,  -- JSON: [{name, sql}] where sql returns entity_id, value, event_at
+  created_at
+)
 ```
 
 `flags.fields` is a JSON array of attribute definitions used to populate the targeting rule builder:
@@ -234,64 +497,94 @@ experiment_assignments (
 ]
 ```
 
-## Simulation & Statistical Analysis
+## Authentication
 
-The **Simulate** tab lets you design experiments before running them, and understand the statistics behind A/B test results.
+Set the `API_KEY` environment variable to require authentication on all `/api` requests:
 
-### How it works
-
-Pick a flag, set a simulated number of users, and configure the **true conversion rate** per variant — the ground-truth probability you're pretending to know. The simulator draws synthetic users, assigns them to variants according to the flag's real split weights, generates Bernoulli-distributed outcomes, then runs two statistical tests on the result.
-
-The random seed makes runs reproducible: the same seed + same config = the same dataset. Changing the seed redraws from the same distribution, which is useful for understanding sampling variance.
-
-### Frequentist test — two-proportion z-test
-
-Tests the null hypothesis that both variants have the same true conversion rate.
-
-```
-z = (p̂₁ − p̂₂) / SE_pool
-
-SE_pool = √( p̄(1−p̄) · (1/n₁ + 1/n₂) )
-
-p̄ = (n₁p̂₁ + n₂p̂₂) / (n₁ + n₂)   ← weighted pooled proportion
+```sh
+API_KEY=my-secret-key npm start
 ```
 
-The p-value is two-sided at α = 0.05. A result is "statistically significant" if p < 0.05, meaning that if the null were true, you'd see a difference this large less than 5% of the time by chance alone.
+When set:
+- All `/api` requests must include `Authorization: Bearer <key>` or they receive `401 Unauthorized`.
+- Static files (the UI) are always served without authentication.
+- The UI prompts for the key on first load (a login screen), then stores it in `localStorage` and includes it automatically on all API calls. A `401` at any point clears the stored key and shows the login screen again.
 
-**What the p-value does not tell you:** the probability that treatment is better than control, the size of the effect, or whether the result is practically meaningful.
+Leave `API_KEY` unset for unauthenticated local development.
 
-### Bayesian test — Beta-Binomial
+## Statistical Analysis
 
-Uses a Beta(1,1) uninformative prior (equivalent to having seen zero previous data). After observing the data, the posterior for each arm's true rate is:
-
-```
-posterior ∝ Beta(1 + conversions, 1 + non-conversions)
-```
-
-The posterior is approximated as normal for large n, which lets us compute:
+All analysis modes use the **delta method** to compute confidence intervals on relative lift Δ = (μ_T − μ_C) / μ_C. This works for both binary (conversion rate) and continuous (revenue, latency) metrics without changing the formula.
 
 ```
-P(treatment > control) = Φ( (μ₂ − μ₁) / √(σ₁² + σ₂²) )
+σ²_Δ = (μ_T/μ_C)² × ( σ²_C/(n_C·μ_C²)  +  σ²_T/(n_T·μ_T²) )
 ```
 
-where μ and σ² are the posterior mean and variance of each Beta.
+Where μ and σ² are the per-user mean and Bessel-corrected sample variance across all assigned users (non-converters contribute 0).
 
-This produces a direct probability statement: "there is an 87% chance treatment converts better than control, given the data." Unlike a p-value, this can be read at face value and updated as more data arrives.
+### Analysis Methods
 
-The 95% credible interval on the difference can also be interpreted directly: "there is a 95% probability the true difference lies in this range" — which is what most people incorrectly believe a frequentist confidence interval means.
+Four methods are available in the UI and used across both the Results card (flag detail page), the Simulate tab, and the Warehouse Analysis tab.
 
-### Power and sample size
+#### Fixed-sample (classical frequentist)
 
-**Achieved power** is the probability you would detect the true effect (if it exists) at α = 0.05, given the sample sizes in this simulation. It uses the actual observed arm sizes n₁ and n₂ and the weighted pooled SE under H₀:
+Two-sided z-test on the relative lift. Use this when you commit to a sample size before the experiment and look at results exactly once.
 
 ```
-power = Φ( (|p₁ − p₂| − 1.96 · SE_null) / SE_alt )
-
-SE_null = √( p̄(1−p̄) · (1/n₁ + 1/n₂) )
-SE_alt  = √( p₁(1−p₁)/n₁ + p₂(1−p₂)/n₂ )
+z = Δ / σ_Δ
+p-value = 2 · Φ(−|z|)
+95% CI: Δ ± 1.96 · σ_Δ
 ```
 
-**Required total N** is solved analytically for 80% power (z_β = 0.842) at the flag's actual allocation weights w₁ and w₂:
+**When to use:** you've pre-registered a stopping rule and won't peek early. The p-value and CI are valid only at the planned sample size — peeking inflates Type I error.
+
+#### Sequential (Howard et al.)
+
+Always-valid confidence sequences using the time-uniform mixture martingale from Howard et al. (2021). The CI is valid at every sample size simultaneously — you can check results at any time without inflating α.
+
+```
+B(t) = √( (t+ρ)/t · log((t+ρ) / (ρ·α²)) )
+CI:   Δ ± B(t) · σ_Δ
+ρ = 10000 / ( log(log(e/α²)) − 2·log(α) )
+```
+
+ρ is tuned for experiments targeting ~10,000 total observations. The CI is wider than a fixed-sample CI (the price of always-valid inference) but asymptotically tightens as t grows.
+
+**When to use:** continuous monitoring, no pre-committed stopping rule. Safe to check daily.
+
+#### Sequential hybrid
+
+Same Howard et al. formula, but ρ is tuned to a user-specified **planned sample size** N instead of 10,000. At t = N the CI is as tight as it can be while remaining always-valid at every earlier look. Before N it is wider; after N it continues to tighten.
+
+```
+ρ = N / ( log(log(e/α²)) − 2·log(α) )
+```
+
+**When to use:** you have a planned experiment duration but want to be able to call it early if an effect is obvious. Enter N = total users you expect by the end date.
+
+#### Bayesian (Gaussian prior)
+
+Gaussian prior N(0, 0.05²) on the relative lift (a weak prior that encodes "effects are usually within ±10%"). Posterior is the precision-weighted update:
+
+```
+precision_prior = 1/0.05²  = 400
+precision_data  = 1/σ²_Δ
+
+posterior mean  = (precision_data · Δ) / (precision_prior + precision_data)
+posterior σ     = 1/√(precision_prior + precision_data)
+
+P(lift > 0) = Φ(posterior_mean / posterior_σ)
+```
+
+The 95% credible interval is `posterior_mean ± 1.96 · posterior_σ` and can be read directly: "there is a 95% probability the true relative lift lies in this range."
+
+**When to use:** you want a probability statement rather than a rejection decision, or you want the prior to regularize small samples toward zero.
+
+### Power and Sample Size
+
+**Achieved power** — probability of detecting the observed effect at α = 0.05 given the actual sample sizes. Displayed alongside Fixed-sample results as a health check.
+
+**Required N for 80% power** — solved analytically accounting for the flag's actual split weights w₁ and w₂:
 
 ```
 N = ( 1.96·√(p̄(1−p̄)·(1/w₁+1/w₂))  +  0.842·√(p₁(1−p₁)/w₁ + p₂(1−p₂)/w₂) )²
@@ -299,53 +592,148 @@ N = ( 1.96·√(p̄(1−p̄)·(1/w₁+1/w₂))  +  0.842·√(p₁(1−p₁)/w�
                               (p₁ − p₂)²
 ```
 
-This correctly accounts for unequal allocation. A 90/10 split requires substantially more total users than a 50/50 split for the same effect size, because the minority arm accumulates observations slowly and dominates the variance. The required N and power warning in the UI both display the actual split ratio so this trade-off is visible.
+Unequal splits increase the required N: a 90/10 split needs substantially more total users than a 50/50 split for the same effect.
 
-### Significance, power, and the winner's curse
-
-α = 0.05 is the significance threshold. A result is flagged significant when p < 0.05, meaning the observed difference would occur less than 5% of the time by chance if the null hypothesis were true.
-
-Power and significance measure different things and both matter:
+### Significance, Power, and the Winner's Curse
 
 | State | Meaning |
 |---|---|
-| Significant + well-powered (≥ 60%) | Result is reliable. The observed effect is a reasonable estimate of the true effect. |
-| Significant + underpowered (< 60%) | **Winner's curse.** The result is real in the frequentist sense, but the estimated effect size is probably inflated. |
-| Not significant + underpowered | Inconclusive. You can't distinguish "no effect" from "effect too small to detect." |
-| Not significant + well-powered | Genuine null result. You had enough data to detect a real effect and didn't find one. |
+| Significant + well-powered (≥ 60%) | Result is reliable. |
+| Significant + underpowered (< 60%) | **Winner's curse.** Effect size is probably inflated. |
+| Not significant + underpowered | Inconclusive — can't distinguish no effect from too small to detect. |
+| Not significant + well-powered | Genuine null — you had enough data and found nothing. |
 
-**Why significant + underpowered is dangerous (the winner's curse):**
+With low power, you can only cross p < 0.05 when sampling noise pushes the estimate up. The runs that come up significant are the ones where noise inflated the effect. This is why low-power significant results don't replicate.
 
-With low power and a small sample, you can only cross p < 0.05 if the *observed* difference happens to be large — which means you need sampling noise to push the estimate up. The specific runs that come up significant are the ones where noise inflated the apparent effect. The true effect, measured with a much larger sample, would typically be smaller.
+### Sample Ratio Mismatch (SRM) Detection
 
-This is a Type M error (error in **m**agnitude): you detected that something is going on, but you're overestimating how big it is. Decisions made on winner's curse results — "this feature boosted conversion by 8%, ship it!" — tend not to replicate.
-
-You can verify this in the simulator: configure a small true effect (e.g. 10% vs 11%), set N = 500, and re-roll the seed repeatedly. Most runs will be non-significant. The ones that turn significant will show observed differences much larger than 1pp. That gap between what you set and what you observe in significant-only runs is the winner's curse in action.
-
-**The 60% power threshold** used to separate green from amber in the UI is a practical judgement call, not a hard statistical rule. 80% is the conventional target for experiment design. Results between 60–80% are flagged with a softer warning; below 60% alongside a significant result triggers the winner's curse warning.
-
-### CUPED (planned)
-
-CUPED (Controlled-experiment Using Pre-Experiment Data) is a variance reduction technique that uses a pre-experiment covariate (e.g., a user's conversion rate in the week before the experiment) to reduce noise in the metric. The adjustment is:
+An SRM occurs when observed traffic differs significantly from split weights. Chi-squared goodness-of-fit test:
 
 ```
-Y_adj = Y − θ·(X − mean(X))
-θ = Cov(Y, X) / Var(X)
+χ² = Σ (observed − expected)² / expected
 ```
 
-Because X is measured before treatment assignment it cannot be affected by the treatment, so the adjusted metric has the same expected value but lower variance — often 20–40% reduction. This means you need 20–40% fewer users for the same power. Simulation support for CUPED (including a correlated pre-period covariate) is planned once continuous metrics are added.
+Under the null, χ² ~ χ²(k−1). A p-value below 0.05 is flagged as an SRM. Causes are almost always bugs (cookie deletion, bot traffic, redirect issues, inconsistent bucketing) — not real effects. Running an experiment with an SRM invalidates results.
+
+## Simulate Tab
+
+Pick a flag, set simulated user count and a true conversion rate per variant. The simulator:
+1. Draws synthetic users, assigns to variants via the flag's real split weights
+2. Generates Bernoulli outcomes at the configured rates
+3. Runs the selected analysis method (all four are available)
+4. Displays lift, CI, p-value/probability, power, and required N
+
+The random seed makes runs reproducible. Changing the seed redraws from the same distribution — useful for understanding sampling variance. Re-roll repeatedly with a small effect to see the winner's curse in action: most seeds are non-significant, and the ones that are significant show much larger apparent effects than the true difference you set.
+
+## Warehouse Analysis Tab
+
+The Warehouse tab lets you run a full Eppo-style analysis directly against your data warehouse without ingesting events into the platform's metric_events table.
+
+### How it works
+
+You provide two SQL snippets:
+- **Assignment SQL** — any query returning `entity_id`, `variant`, `assigned_at`
+- **Metric SQL** (one per metric) — any query returning `entity_id`, `value`, `event_at`
+
+The server composes them into a single CTE query:
+
+```sql
+WITH assignments AS ( <your SQL> ),
+     metric_raw  AS ( <your SQL> ),
+     per_user    AS (
+       SELECT a.variant, a.entity_id, COALESCE(SUM(m.value), 0) AS user_value
+       FROM assignments a
+       LEFT JOIN metric_raw m
+         ON  m.entity_id   = a.entity_id
+         AND m.event_at   >= a.assigned_at   -- post-assignment only
+       GROUP BY a.variant, a.entity_id
+     )
+SELECT variant,
+       COUNT(*)                                    AS assigned,
+       COUNT(CASE WHEN user_value > 0 THEN 1 END) AS converted,
+       SUM(user_value)                             AS total_value,
+       SUM(user_value * user_value)                AS sum_sq_value
+FROM per_user GROUP BY variant
+```
+
+This query runs through the active database adapter. With BigQuery configured it executes directly against BigQuery — your SQL snippets can reference fully-qualified tables (`project.dataset.table`) anywhere in your warehouse.
+
+### Workflow
+
+1. Write your **Assignment SQL** — typically a query against your experiment assignment log, filtered to one experiment
+2. Add one or more **Metrics** — name + SQL per metric
+3. Choose an analysis method
+4. Click **Run Analysis**
+5. Optionally **Save** the config for reuse
+
+Configs are persisted to `warehouse_configs` across restarts.
+
+### Example (BigQuery)
+
+**Assignment SQL:**
+```sql
+SELECT
+  user_id        AS entity_id,
+  variant_key    AS variant,
+  assigned_at
+FROM `myproject.analytics.experiment_assignments`
+WHERE experiment_key = 'new-checkout'
+  AND assigned_at >= '2024-03-01'
+```
+
+**Conversion metric SQL:**
+```sql
+SELECT
+  user_id      AS entity_id,
+  1            AS value,
+  converted_at AS event_at
+FROM `myproject.analytics.order_events`
+WHERE event_type = 'purchase'
+```
+
+**Revenue metric SQL:**
+```sql
+SELECT
+  user_id       AS entity_id,
+  order_total   AS value,
+  created_at    AS event_at
+FROM `myproject.analytics.orders`
+```
+
+Running this with the Bayesian method on a BigQuery-connected instance executes both queries against BigQuery and returns posterior credible intervals on the relative lift for both conversion rate and revenue per user.
 
 ## UI
 
-Four tabs:
+Six sections accessible from the top nav:
 
-**Flags** — Create and manage flags. Toggle on/off. Click into a flag to manage variants, define targeting attribute fields, and build allocations.
+**Flags** — Create and manage flags. Toggle on/off. Click into a flag to:
+- Manage variants and define targeting attribute fields
+- Build allocations with the visual rule builder
+- Control the experiment lifecycle (Start / Stop / Restart / Reset buttons)
+- View status badges (draft / running / stopped)
+- See the SRM widget (when running or stopped)
+- View the Results card with per-variant metric analysis and analysis method selector
 
 **Evaluate** — Test any flag evaluation in the browser. Pick a flag to pre-populate a sample payload, edit the `user_id` and `attributes`, then run it. The page shows the full JSON response and an equivalent `curl` command you can copy.
 
 **Assignments** — Live view of the `experiment_assignments` table. Filter by flag, paginate, clear. Click `{…}` in the Attributes column to inspect the full context that was evaluated.
 
-**Simulate** — Design experiments before launch. Configure true conversion rates per variant, run a synthetic dataset through both frequentist and Bayesian tests, and see power analysis accounting for your flag's actual split weights.
+**Simulate** — Design experiments before launch. Configure true conversion rates per variant, run a synthetic dataset through any of the four analysis methods, and see power analysis accounting for your flag's actual split weights.
+
+**Warehouse** — Run analysis directly against your data warehouse. Write assignment SQL and per-metric SQL snippets, select an analysis method, and get the same statistical output as the Results card. Configs are saved and reloadable.
+
+### Analysis method selector
+
+Available in the Results card, Simulate tab, and Warehouse tab. Switching method changes:
+
+| Method | Stat shown | CI label | Verdict |
+|---|---|---|---|
+| Fixed-sample | p-value | 95% CI | significant / not significant |
+| Sequential | — | Anytime-valid 95% CI | anytime-valid result / no conclusion yet |
+| Sequential hybrid | — | Anytime-valid 95% CI (hybrid) | same as sequential |
+| Bayesian | P(treatment > control) | 95% credible interval | probability statement |
+
+Sequential hybrid shows an additional **Planned N** input — enter the total users you expect by your experiment's end date.
 
 ## Node.js SDK
 
@@ -358,7 +746,9 @@ import { ExperimentClient } from './sdk/index.js';
 
 const client = new ExperimentClient({
   host:            'http://localhost:3000',
-  pollingInterval: 60_000,           // optional, default 60s
+  apiKey:          process.env.EXPERIMENT_API_KEY, // optional; required if API_KEY is set server-side
+  pollingInterval: 60_000,                          // optional, default 60s
+  maxQueueSize:    500,                             // optional; drop events if queue exceeds this
   onError:         e => console.error('[experiment]', e.message), // optional
 });
 
@@ -396,23 +786,44 @@ Evaluation is fully synchronous. The result object matches the shape returned by
 client.logAssignment('my-flag', 'user-123', result, { country: 'US', plan: 'enterprise' });
 ```
 
-This POSTs to `POST /api/assignments` asynchronously. Errors are routed to `onError` if configured, otherwise silently swallowed. The stale config is always retained on fetch failures so in-flight traffic is unaffected.
+Delivery is asynchronous with up to 3 retries at exponential backoff (1s, 2s, 4s). If the retry queue exceeds `maxQueueSize`, events are dropped and `onError` is called. Errors are never thrown from this method.
 
-You control when logging happens — log after every evaluation, or batch them, or skip logging entirely for internal health checks.
+### Tracking metric events
+
+```js
+// Record a conversion event — fire-and-forget with the same retry semantics
+client.trackMetricEvent('my-flag', 'user-123', 'conversion');
+
+// Record a revenue event with a custom value
+client.trackMetricEvent('my-flag', 'user-123', 'revenue', 49.99);
+```
+
+POSTs to `POST /api/metrics/events`. The server joins these events with `experiment_assignments` to compute per-variant metric results.
+
+### Observability
+
+```js
+client.flagCount       // number of flags currently cached
+client.pendingLogCount // in-flight log + metric events (useful for health checks)
+```
 
 ### Shutdown
 
 ```js
-client.close(); // clears the polling interval
+// Stop polling and wait up to 5s for in-flight events to flush
+await client.close();
+
+// Custom timeout
+await client.close(10_000);
 ```
+
+Call `close()` during graceful shutdown to avoid dropping queued assignments or metric events.
 
 ### How the SDK config endpoint works
 
 `GET /api/sdk/config` returns all enabled flags with their variants and allocations in a single response. The SDK caches this as a `Map<flagKey, flag>` and evaluates entirely from memory.
 
-Bucket computation, targeting rule evaluation, and split assignment are implemented in `lib/evaluate.js`, which is imported by both the API route and the SDK. This structural sharing guarantees that `client.evaluate()` and `POST /api/evaluate` will always produce identical results for the same input — there is no separate implementation to drift.
-
-Disabled flags are excluded from the config snapshot. If a flag is disabled between polls, the SDK will continue serving the last known state for up to one polling interval.
+Bucket computation, targeting rule evaluation, and split assignment are implemented in `lib/evaluate.js`, which is imported by both the API route and the SDK. This structural sharing guarantees that `client.evaluate()` and `POST /api/evaluate` will always produce identical results for the same input.
 
 ## Testing
 
@@ -443,32 +854,36 @@ Tests live in `test/evaluate.test.js` and target `lib/evaluate.js` — the share
 - No allocations returns `no_matching_allocation`
 - 50/50 split: users with bucket < 50 get control, ≥ 50 get treatment
 - Result includes correct `bucket` and `allocation_id`
-- `result.bucket` always equals `getBucket(userId, flagKey)`
-- `split_exhausted` when splits don't cover the full 0–99 range and bucket falls in the gap
+- `split_exhausted` when splits don't cover the full 0–99 range
 - Targeting rule match/no-match
 - `user_id` is automatically injected into the targeting context
 - Multi-allocation priority: first matching allocation wins
-- Split referencing a missing variant key returns `null` value without crashing
-
-### Architecture note
-
-The test suite is also a contract: because both the API route (`routes/evaluate.js`) and the SDK (`sdk/index.js`) import from `lib/evaluate.js`, passing these tests is sufficient to guarantee consistent behavior across both consumers. If you ever need to change the evaluation algorithm, update `lib/evaluate.js` and the tests — both consumers get the change automatically.
 
 ## Extending
 
 **Adding a new API route**: create a file in `routes/`, export a Fastify plugin function, register it in `server.js`.
 
-**Changing the schema**: edit `db.js`. For changes to existing tables, add a migration block under `if (version < N)` and increment `pragma user_version`.
+**Changing the schema**: edit all three adapter files (`db/sqlite.js`, `db/postgres.js`, `db/bigquery.js`). For SQLite changes to existing tables, add a migration block under `if (version < N)` and increment `pragma user_version`. For new tables, `CREATE TABLE IF NOT EXISTS` in all three adapters is sufficient.
 
 **Frontend changes**: edit `public/app.js`. It's plain React with JSX transpiled by Babel standalone in the browser. No build step — save and refresh. Bump `?v=N` on the script tag in `index.html` to bust the Babel transform cache.
 
 ## Roadmap
 
-See [PLAN.md](./PLAN.md) for the full feature roadmap covering:
+### Completed
 
-- Statistical engine (SRM detection, t-test/z-test, sequential testing, CUPED, power analysis)
-- Experiment lifecycle management (hypothesis, status machine, allocation locking, required sample size)
-- Results UI (forest plots, confidence intervals, time-series, segment breakdowns)
-- LLM-powered features via Claude API (results interpreter, power analysis assistant, hypothesis generator, metric recommender)
-- Node.js SDK with in-process evaluation and async event batching
-- BigQuery integration for warehouse-scale analysis
+- **BigQuery adapter** — SQLite, Postgres, and BigQuery all supported via a unified db adapter interface. BigQuery handles strict typing, ID generation, and default injection automatically.
+- **API key authentication** — Bearer token auth on all `/api` routes; UI login screen + localStorage key storage.
+- **Experiment lifecycle** — `draft → running → stopped` state machine; variants and allocations locked while running.
+- **SRM detection** — chi-squared goodness-of-fit test displayed on every running/stopped experiment.
+- **Node.js SDK** — local flag evaluation, assignment logging with retry queue, metric event tracking, graceful shutdown.
+- **Fixed-sample analysis** — delta-method CIs on relative lift for binary and continuous metrics.
+- **Sequential analysis** — Howard et al. time-uniform confidence sequences (always-valid, peek any time).
+- **Sequential hybrid** — sequential CIs tuned to a planned stopping sample size for maximum power at the end date while remaining valid at every earlier look.
+- **Bayesian analysis** — Gaussian prior N(0, 0.05²) on relative lift; posterior credible intervals and P(treatment > control).
+- **Warehouse Analysis tab** — Eppo-style facts-table analysis: write assignment SQL and metric SQL, server composes a CTE and runs it against the active adapter (BigQuery, Postgres, or SQLite). Configs saved to `warehouse_configs`.
+
+### Planned
+
+- **CUPED** — variance reduction using pre-experiment covariates (20–40% fewer users for the same power). `Y_adj = Y − θ·(X − mean(X))` where X is a pre-experiment covariate correlated with Y.
+- **Results UI enhancements** — time-series lift over the experiment duration, segment breakdowns, forest plots
+- **LLM-powered features** — results interpreter, power analysis assistant, hypothesis generator (Claude API)
