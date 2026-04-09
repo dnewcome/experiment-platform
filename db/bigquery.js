@@ -59,6 +59,15 @@ const INT64_COLUMNS = new Set(['id', 'flag_id', 'allocation_id', 'bucket', 'prio
 //   - string integer for an INT64 column → Number (BigQuery strict typing)
 function prepareParams(sql, params) {
   if (!params.length) return { sql, params };
+
+  // For INSERT statements, build a positional column-name map so we can
+  // coerce each param to the right type based on its column.
+  let insertColMap = null;
+  const insertMatch = sql.match(/^\s*INSERT\s+INTO\s+\S+\s*\(([^)]+)\)/i);
+  if (insertMatch) {
+    insertColMap = insertMatch[1].split(',').map(c => c.trim().toLowerCase());
+  }
+
   const segments = sql.split('?');
   let outSql = '';
   const outParams = [];
@@ -72,9 +81,18 @@ function prepareParams(sql, params) {
     }
 
     if (typeof v === 'string' && /^\d+$/.test(v)) {
-      // Check the column name immediately before this ? (handles col = ? patterns)
-      const m = seg.match(/\b(\w+)\s*=\s*$/i);
-      if (m && INT64_COLUMNS.has(m[1].toLowerCase())) {
+      let colName = null;
+
+      if (insertColMap) {
+        // For INSERT, params align with the column list positionally
+        colName = insertColMap[i];
+      } else {
+        // For WHERE/SET, find the column name just before this ?
+        const m = seg.match(/\b(\w+)\s*=\s*$/i);
+        if (m) colName = m[1].toLowerCase();
+      }
+
+      if (colName && INT64_COLUMNS.has(colName)) {
         v = Number(v);
       }
     }
