@@ -5,6 +5,7 @@ import { dirname, join } from 'path';
 import flagRoutes from './routes/flags.js';
 import evaluateRoute from './routes/evaluate.js';
 import metricsRoutes from './routes/metrics.js';
+import analysisRoutes from './routes/analysis.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +33,7 @@ if (process.env.API_KEY) {
 await app.register(flagRoutes,    { prefix: '/api' });
 await app.register(evaluateRoute, { prefix: '/api' });
 await app.register(metricsRoutes, { prefix: '/api' });
+await app.register(analysisRoutes, { prefix: '/api' });
 
 app.setNotFoundHandler((_req, reply) => {
   reply.sendFile('index.html');

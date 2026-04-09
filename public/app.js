@@ -1836,6 +1836,337 @@ function SimulateView() {
 }
 
 // ---------------------------------------------------------------------------
+// WarehouseView — Eppo-style facts-table analysis
+// ---------------------------------------------------------------------------
+//
+// The user provides two SQL snippets per analysis:
+//   assignment_sql — returns (entity_id, variant, assigned_at)
+//   metric_sql     — returns (entity_id, value, event_at)
+// The server composes them into a CTE that joins and aggregates per variant.
+// Configs are saved to warehouse_configs and run against the active DB adapter
+// (SQLite, Postgres, or BigQuery), so the query literally hits your warehouse.
+
+const ASSIGN_PLACEHOLDER = `-- Must return: entity_id, variant, assigned_at
+-- Example (BigQuery):
+SELECT
+  user_id        AS entity_id,
+  variant_key    AS variant,
+  assigned_at
+FROM \`myproject.dataset.experiment_assignments\`
+WHERE experiment_key = 'my-flag-key'`;
+
+const METRIC_PLACEHOLDER = `-- Must return: entity_id, value, event_at
+-- Example (BigQuery):
+SELECT
+  user_id      AS entity_id,
+  1            AS value,
+  converted_at AS event_at
+FROM \`myproject.dataset.conversions\``;
+
+function WarehouseView() {
+  const [configs,       setConfigs]       = useState([]);
+  const [activeId,      setActiveId]      = useState(null);   // saved config id
+  const [configName,    setConfigName]    = useState('');
+  const [assignSql,     setAssignSql]     = useState('');
+  const [metrics,       setMetrics]       = useState([{ name: 'conversion', sql: '' }]);
+  const [method,        setMethod]        = useState('fixed_sample');
+  const [nTarget,       setNTarget]       = useState(10000);
+  const [running,       setRunning]       = useState(false);
+  const [results,       setResults]       = useState([]);    // [{metric_name, variants, analyses}]
+  const [error,         setError]         = useState('');
+
+  useEffect(() => { refreshConfigs(); }, []);
+
+  async function refreshConfigs() {
+    const r = await api.get('/analysis/configs');
+    if (Array.isArray(r)) setConfigs(r);
+  }
+
+  function loadConfig(cfg) {
+    setActiveId(cfg.id);
+    setConfigName(cfg.name);
+    setAssignSql(cfg.assignment_sql ?? '');
+    setMetrics(Array.isArray(cfg.metrics) && cfg.metrics.length > 0
+      ? cfg.metrics
+      : [{ name: 'conversion', sql: '' }]);
+    setResults([]);
+    setError('');
+  }
+
+  function newConfig() {
+    setActiveId(null);
+    setConfigName('');
+    setAssignSql('');
+    setMetrics([{ name: 'conversion', sql: '' }]);
+    setResults([]);
+    setError('');
+  }
+
+  async function saveConfig() {
+    if (!configName.trim()) { alert('Enter a config name first.'); return; }
+    const body = { name: configName, assignment_sql: assignSql, metrics };
+    if (activeId) {
+      await api.put(`/analysis/configs/${activeId}`, body);
+    } else {
+      const r = await api.post('/analysis/configs', body);
+      if (r.id) setActiveId(r.id);
+    }
+    refreshConfigs();
+  }
+
+  async function deleteConfig() {
+    if (!activeId) return;
+    if (!confirm('Delete this config?')) return;
+    await api.del(`/analysis/configs/${activeId}`);
+    newConfig();
+    refreshConfigs();
+  }
+
+  async function runQuery() {
+    setError('');
+    setResults([]);
+    if (!assignSql.trim()) { setError('Assignment SQL is required.'); return; }
+    const validMetrics = metrics.filter(m => m.sql.trim());
+    if (!validMetrics.length) { setError('At least one metric SQL is required.'); return; }
+
+    setRunning(true);
+    const out = [];
+    for (const m of validMetrics) {
+      const r = await api.post('/analysis/run', {
+        assignment_sql: assignSql,
+        metric_sql:     m.sql,
+        metric_name:    m.name,
+      });
+      if (r.error) { setError(`${m.name}: ${r.error}`); setRunning(false); return; }
+      // Compute pairwise analyses (first variant = control)
+      const ctrl = r.variants[0];
+      const analyses = ctrl
+        ? r.variants.slice(1).map(trt => {
+            const analysis = runAnalysis(
+              { assigned: ctrl.assigned, mean: ctrl.mean, variance: ctrl.variance },
+              { assigned: trt.assigned,  mean: trt.mean,  variance: trt.variance },
+              method, 0.05, nTarget,
+            );
+            return { trt, analysis };
+          })
+        : [];
+      out.push({ ...r, ctrl, analyses });
+    }
+    setResults(out);
+    setRunning(false);
+  }
+
+  function setMetricField(i, field, val) {
+    setMetrics(ms => ms.map((m, j) => j === i ? { ...m, [field]: val } : m));
+  }
+  function addMetric() {
+    setMetrics(ms => [...ms, { name: '', sql: '' }]);
+  }
+  function removeMetric(i) {
+    setMetrics(ms => ms.filter((_, j) => j !== i));
+  }
+
+  const pct    = n => (n * 100).toFixed(2) + '%';
+  const fmt    = (n, d=4) => n.toFixed(d);
+  const relPct = n => (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%';
+
+  return (
+    <div>
+      {/* ── Configs sidebar + header ── */}
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="section-header" style={{ marginBottom: 12 }}>
+          <div className="section-label">Warehouse Analysis</div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <select className="input" value={activeId ?? ''} onChange={e => {
+              const cfg = configs.find(c => String(c.id) === e.target.value);
+              if (cfg) loadConfig(cfg); else newConfig();
+            }}>
+              <option value="">— new config —</option>
+              {configs.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            <input className="input" placeholder="Config name" value={configName}
+              onChange={e => setConfigName(e.target.value)} style={{ width: 180 }} />
+            <button className="btn btn-sm btn-primary" onClick={saveConfig}>
+              {activeId ? 'Update' : 'Save'}
+            </button>
+            {activeId && <button className="btn btn-sm" onClick={deleteConfig}>Delete</button>}
+          </div>
+        </div>
+
+        {/* ── Assignment SQL ── */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: '#555', marginBottom: 6 }}>
+            Assignment SQL
+            <span style={{ fontWeight: 400, marginLeft: 8, color: '#888' }}>
+              must return <code>entity_id</code>, <code>variant</code>, <code>assigned_at</code>
+            </span>
+          </div>
+          <textarea
+            className="input"
+            style={{ width: '100%', height: 120, fontFamily: 'monospace', fontSize: 12, resize: 'vertical' }}
+            placeholder={ASSIGN_PLACEHOLDER}
+            value={assignSql}
+            onChange={e => setAssignSql(e.target.value)}
+          />
+        </div>
+
+        {/* ── Metrics ── */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>
+              Metrics
+              <span style={{ fontWeight: 400, marginLeft: 8, color: '#888' }}>
+                must return <code>entity_id</code>, <code>value</code>, <code>event_at</code>
+              </span>
+            </div>
+            <button className="btn btn-sm" onClick={addMetric}>+ Add metric</button>
+          </div>
+          {metrics.map((m, i) => (
+            <div key={i} style={{ marginBottom: 12, padding: '10px 12px', background: '#f8f9fc', borderRadius: 6, border: '1px solid #e5e5e5' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <input className="input" placeholder="Metric name" value={m.name}
+                  onChange={e => setMetricField(i, 'name', e.target.value)}
+                  style={{ width: 180, fontSize: 12 }} />
+                {metrics.length > 1 && (
+                  <button className="btn btn-sm" onClick={() => removeMetric(i)} style={{ marginLeft: 'auto' }}>✕ Remove</button>
+                )}
+              </div>
+              <textarea
+                className="input"
+                style={{ width: '100%', height: 100, fontFamily: 'monospace', fontSize: 12, resize: 'vertical' }}
+                placeholder={METRIC_PLACEHOLDER}
+                value={m.sql}
+                onChange={e => setMetricField(i, 'sql', e.target.value)}
+              />
+            </div>
+          ))}
+        </div>
+
+        {/* ── Analysis settings + run ── */}
+        <div className="form-row" style={{ alignItems: 'flex-end', gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Analysis method</div>
+            <select className="input" value={method} onChange={e => setMethod(e.target.value)}>
+              <option value="fixed_sample">Fixed-sample</option>
+              <option value="sequential">Sequential</option>
+              <option value="sequential_hybrid">Sequential hybrid</option>
+              <option value="bayesian">Bayesian</option>
+            </select>
+          </div>
+          {method === 'sequential_hybrid' && (
+            <div>
+              <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Planned N (total)</div>
+              <input className="input" type="number" min="100" step="100" value={nTarget}
+                onChange={e => setNTarget(Number(e.target.value))} style={{ width: 120 }} />
+            </div>
+          )}
+          <div style={{ alignSelf: 'flex-end' }}>
+            <button className="btn btn-primary" onClick={runQuery} disabled={running}>
+              {running ? 'Running…' : 'Run Analysis'}
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <div style={{ marginTop: 12, padding: '10px 14px', background: '#f8d7da', color: '#721c24', borderRadius: 6, fontSize: 13, fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* ── Results ── */}
+      {results.map(res => (
+        <div key={res.metric_name} className="card" style={{ marginBottom: 16 }}>
+          <h2 style={{ marginBottom: 4 }}>
+            {res.metric_name}
+            <span style={{ fontWeight: 400, fontSize: 13, color: '#666', marginLeft: 10 }}>
+              {{ fixed_sample: 'Fixed-sample', sequential: 'Sequential (anytime-valid)', sequential_hybrid: `Sequential hybrid (N=${nTarget.toLocaleString()})`, bayesian: 'Bayesian' }[method]}
+            </span>
+          </h2>
+          <div className="muted" style={{ marginBottom: 12, fontSize: 12 }}>
+            Relative lift = (treatment − control) / control · α = 0.05
+          </div>
+
+          {/* Raw variant table */}
+          <table style={{ marginBottom: 16 }}>
+            <thead>
+              <tr>
+                <th>Variant</th>
+                <th style={{ textAlign: 'right' }}>Assigned</th>
+                <th style={{ textAlign: 'right' }}>Converted</th>
+                <th style={{ textAlign: 'right' }}>Rate</th>
+                <th style={{ textAlign: 'right' }}>Mean value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {res.variants.map((v, i) => (
+                <tr key={v.variant}>
+                  <td>
+                    <span className="flag-key">{v.variant}</span>
+                    {i === 0 && <span className="muted" style={{ fontSize: 11, marginLeft: 6 }}>control</span>}
+                  </td>
+                  <td style={{ textAlign: 'right' }}>{v.assigned.toLocaleString()}</td>
+                  <td style={{ textAlign: 'right' }}>{v.converted.toLocaleString()}</td>
+                  <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{pct(v.rate)}</td>
+                  <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{fmt(v.mean)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {/* Per-treatment analysis */}
+          {res.analyses.map(({ trt, analysis }) => {
+            if (!analysis) return null;
+            const isSeq  = analysis.method === 'sequential' || analysis.method === 'sequential_hybrid';
+            const displayLift = analysis.method === 'bayesian' ? analysis.postMean : analysis.lift;
+            const sig    = analysis.method === 'bayesian'
+              ? (analysis.probPositive >= 0.95 || analysis.probPositive <= 0.05)
+              : (analysis.lo > 0 || analysis.hi < 0);
+            const { bg, tx } = sig ? { bg: '#d4edda', tx: '#155724' } : { bg: '#f8d7da', tx: '#721c24' };
+            const ciLabel = { sequential: 'Anytime-valid 95% CI', sequential_hybrid: 'Anytime-valid 95% CI (hybrid)', bayesian: '95% credible interval' }[analysis.method] ?? '95% CI';
+            const statField = analysis.method === 'bayesian'
+              ? ['P(treatment > control)', pct(analysis.probPositive)]
+              : ['p-value', analysis.pValue != null ? fmt(analysis.pValue, 4) : (sig ? '< α' : '> α')];
+            const verdictMsg = analysis.method === 'bayesian'
+              ? (analysis.probPositive >= 0.95 ? `Treatment better with ${pct(analysis.probPositive)} probability`
+                : analysis.probPositive <= 0.05 ? `Control better — P(T > C) = ${pct(analysis.probPositive)}`
+                : `Inconclusive — P(T > C) = ${pct(analysis.probPositive)}`)
+              : isSeq
+                ? (sig ? `Anytime-valid result: ${relPct(analysis.lift)} relative lift` : 'No conclusion yet — CI contains 0')
+                : (analysis.pValue < 0.05 ? `Statistically significant (p = ${fmt(analysis.pValue)})`
+                  : analysis.pValue < 0.1  ? `Marginal (p = ${fmt(analysis.pValue)})`
+                  : `Not significant (p = ${fmt(analysis.pValue)})`);
+
+            return (
+              <div key={trt.variant} style={{ marginBottom: 14 }}>
+                <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 13 }}>
+                  <span className="flag-key">{trt.variant}</span> vs <span className="flag-key">{res.ctrl.variant}</span>
+                </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
+                  {[
+                    ['Relative lift', relPct(displayLift)],
+                    [ciLabel, `[${relPct(analysis.lo)}, ${relPct(analysis.hi)}]`],
+                    statField,
+                  ].map(([label, val]) => (
+                    <div key={label} style={{ background: '#f8f9fc', border: '1px solid #e5e5e5', borderRadius: 6, padding: '8px 14px', minWidth: 120 }}>
+                      <div style={{ fontSize: 11, color: '#888', marginBottom: 3 }}>{label}</div>
+                      <div style={{ fontFamily: 'monospace', fontWeight: 600, fontSize: 13 }}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: 'inline-block', padding: '5px 12px', borderRadius: 6, fontWeight: 700, fontSize: 12, background: bg, color: tx }}>
+                  {verdictMsg}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // App root
 // ---------------------------------------------------------------------------
 
@@ -1854,7 +2185,8 @@ function App() {
           <button className={view === 'flags' || view === 'flag-detail' ? 'active' : ''} onClick={goToFlags}>Flags</button>
           <button className={view === 'evaluate' ? 'active' : ''} onClick={() => setView('evaluate')}>Evaluate</button>
           <button className={view === 'assignments' ? 'active' : ''} onClick={() => setView('assignments')}>Assignments</button>
-          <button className={view === 'simulate' ? 'active' : ''} onClick={() => setView('simulate')}>Simulate</button>
+          <button className={view === 'simulate'  ? 'active' : ''} onClick={() => setView('simulate')}>Simulate</button>
+          <button className={view === 'warehouse' ? 'active' : ''} onClick={() => setView('warehouse')}>Warehouse</button>
         </nav>
       </header>
       <main>
@@ -1863,6 +2195,7 @@ function App() {
         {view === 'evaluate'    && <EvaluateView />}
         {view === 'assignments' && <AssignmentsView />}
         {view === 'simulate'    && <SimulateView />}
+        {view === 'warehouse'   && <WarehouseView />}
       </main>
     </div>
   );

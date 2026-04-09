@@ -71,6 +71,14 @@ raw.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_metric_events_flag_user
     ON metric_events (flag_key, user_id, metric_name);
+
+  CREATE TABLE IF NOT EXISTS warehouse_configs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    assignment_sql TEXT NOT NULL DEFAULT '',
+    metrics        TEXT NOT NULL DEFAULT '[]',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 // ---------------------------------------------------------------------------

@@ -61,6 +61,14 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS idx_assignments_assigned_at
       ON experiment_assignments (assigned_at);
 
+    CREATE TABLE IF NOT EXISTS warehouse_configs (
+      id             SERIAL PRIMARY KEY,
+      name           TEXT NOT NULL,
+      assignment_sql TEXT NOT NULL DEFAULT '',
+      metrics        TEXT NOT NULL DEFAULT '[]',
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);
   `);
 

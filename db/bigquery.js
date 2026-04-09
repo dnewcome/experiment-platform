@@ -206,6 +206,16 @@ await runQuery(`
   )
 `);
 
+await runQuery(`
+  CREATE TABLE IF NOT EXISTS warehouse_configs (
+    id             INT64,
+    name           STRING,
+    assignment_sql STRING,
+    metrics        STRING,
+    created_at     STRING
+  )
+`);
+
 // ---------------------------------------------------------------------------
 // INSERT default injection
 //
@@ -227,6 +237,11 @@ const TABLE_DEFAULTS = {
   },
   experiment_assignments: {
     assigned_at: now,
+  },
+  warehouse_configs: {
+    assignment_sql: '',
+    metrics:        '[]',
+    created_at:     now,
   },
 };
 
