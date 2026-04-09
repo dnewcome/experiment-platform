@@ -80,6 +80,11 @@ function prepareParams(sql, params) {
       return;
     }
 
+    // BigQuery has no implicit bool→INT64 coercion; enabled is stored as INT64.
+    if (typeof v === 'boolean') {
+      v = v ? 1 : 0;
+    }
+
     if (typeof v === 'string' && /^\d+$/.test(v)) {
       let colName = null;
 
