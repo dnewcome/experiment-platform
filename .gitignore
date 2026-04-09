@@ -2,3 +2,6 @@ node_modules
 *.db
 *.db-shm
 *.db-wal
+*.json
+!package.json
+!package-lock.json
