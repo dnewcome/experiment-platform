@@ -1565,7 +1565,7 @@ function SimulateView() {
     setVarCfg(c => ({ ...c, [key]: { ...c[key], rate: val } }));
   }
 
-  function runSimulation() {
+  async function runSimulation() {
     const rng     = makePrng(seed);
     const variants = flag.variants;
     // Flatten splits from all allocations into a single bucket map 0-99
