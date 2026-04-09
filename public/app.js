@@ -2048,7 +2048,7 @@ function WarehouseView() {
               </span>
             </div>
             <button className="btn btn-sm" onClick={() => previewSql('assignment', assignSql)}
-              disabled={!assignSql.trim() || previews.assignment?.loading}>
+              disabled={previews.assignment?.loading}>
               {previews.assignment?.loading ? 'Running…' : 'Preview'}
             </button>
           </div>
@@ -2080,7 +2080,7 @@ function WarehouseView() {
                   onChange={e => setMetricField(i, 'name', e.target.value)}
                   style={{ width: 180, fontSize: 12 }} />
                 <button className="btn btn-sm" onClick={() => previewSql(`metric-${i}`, m.sql)}
-                  disabled={!m.sql.trim() || previews[`metric-${i}`]?.loading}>
+                  disabled={previews[`metric-${i}`]?.loading}>
                   {previews[`metric-${i}`]?.loading ? 'Running…' : 'Preview'}
                 </button>
                 {metrics.length > 1 && (
