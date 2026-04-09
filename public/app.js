@@ -22,6 +22,10 @@ async function apiFetch(path, init = {}) {
   if (key) headers['Authorization'] = `Bearer ${key}`;
   const res = await fetch(`/api${path}`, { ...init, headers });
   if (res.status === 401) { _on401?.(); return { error: 'Unauthorized' }; }
+  const ct = res.headers.get('content-type') ?? '';
+  if (!ct.includes('application/json')) {
+    return { error: `Server returned HTTP ${res.status} (non-JSON). Is the server running the latest code?` };
+  }
   return res.json();
 }
 
@@ -1836,6 +1840,35 @@ function SimulateView() {
 }
 
 // ---------------------------------------------------------------------------
+// PreviewResult — renders the output of a SQL preview call
+// ---------------------------------------------------------------------------
+
+function PreviewResult({ preview }) {
+  if (!preview) return null;
+  if (preview.loading) return <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>Running…</div>;
+  if (preview.error)   return <div style={{ fontSize: 12, color: '#721c24', background: '#f8d7da', padding: '6px 10px', borderRadius: 4, marginTop: 6, fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{preview.error}</div>;
+  if (!preview.rows?.length) return <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>No rows returned.</div>;
+  const cols = Object.keys(preview.rows[0]);
+  return (
+    <div style={{ marginTop: 8, overflowX: 'auto' }}>
+      <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>First {preview.rows.length} row{preview.rows.length !== 1 ? 's' : ''}</div>
+      <table style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+        <thead>
+          <tr>{cols.map(c => <th key={c} style={{ fontFamily: 'monospace' }}>{c}</th>)}</tr>
+        </thead>
+        <tbody>
+          {preview.rows.map((row, i) => (
+            <tr key={i}>
+              {cols.map(c => <td key={c} style={{ fontFamily: 'monospace' }}>{row[c] == null ? <span style={{ color: '#aaa' }}>NULL</span> : String(row[c])}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // WarehouseView — Eppo-style facts-table analysis
 // ---------------------------------------------------------------------------
 //
@@ -1978,32 +2011,6 @@ function WarehouseView() {
     }
   }
 
-  function PreviewResult({ previewKey }) {
-    const p = previews[previewKey];
-    if (!p) return null;
-    if (p.loading) return <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>Running…</div>;
-    if (p.error)   return <div style={{ fontSize: 12, color: '#721c24', background: '#f8d7da', padding: '6px 10px', borderRadius: 4, marginTop: 6, fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{p.error}</div>;
-    if (!p.rows?.length) return <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>No rows returned.</div>;
-    const cols = Object.keys(p.rows[0]);
-    return (
-      <div style={{ marginTop: 8, overflowX: 'auto' }}>
-        <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>First {p.rows.length} row{p.rows.length !== 1 ? 's' : ''}</div>
-        <table style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
-          <thead>
-            <tr>{cols.map(c => <th key={c} style={{ fontFamily: 'monospace' }}>{c}</th>)}</tr>
-          </thead>
-          <tbody>
-            {p.rows.map((row, i) => (
-              <tr key={i}>
-                {cols.map(c => <td key={c} style={{ fontFamily: 'monospace' }}>{row[c] == null ? <span style={{ color: '#aaa' }}>NULL</span> : String(row[c])}</td>)}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    );
-  }
-
   const pct    = n => (n * 100).toFixed(2) + '%';
   const fmt    = (n, d=4) => n.toFixed(d);
   const relPct = n => (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%';
@@ -2052,7 +2059,7 @@ function WarehouseView() {
             value={assignSql}
             onChange={e => setAssignSql(e.target.value)}
           />
-          <PreviewResult previewKey="assignment" />
+          <PreviewResult preview={previews.assignment} />
         </div>
 
         {/* ── Metrics ── */}
@@ -2087,7 +2094,7 @@ function WarehouseView() {
                 value={m.sql}
                 onChange={e => setMetricField(i, 'sql', e.target.value)}
               />
-              <PreviewResult previewKey={`metric-${i}`} />
+              <PreviewResult preview={previews[`metric-${i}`]} />
             </div>
           ))}
         </div>
