@@ -37,11 +37,19 @@ if (keyFile) bqOptions.keyFilename = keyFile;
 const bq = new BigQuery(bqOptions);
 const location = process.env.BIGQUERY_LOCATION ?? 'US';
 
-// Ensure dataset exists
+// Ensure main dataset exists
 const [dsExists] = await bq.dataset(datasetId).exists();
 if (!dsExists) {
   await bq.createDataset(datasetId, { location });
   console.log(`BigQuery: created dataset ${projectId}.${datasetId}`);
+}
+
+// Ensure simulation dataset exists
+const simDatasetId = `${datasetId}_simulation`;
+const [simDsExists] = await bq.dataset(simDatasetId).exists();
+if (!simDsExists) {
+  await bq.createDataset(simDatasetId, { location });
+  console.log(`BigQuery: created dataset ${projectId}.${simDatasetId}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +223,36 @@ await runQuery(`
     created_at     STRING
   )
 `);
+
+// Simulation tables live in a separate dataset so they don't pollute the main
+// experiment data. runQuery uses defaultDataset for unqualified names, so we
+// must use the fully-qualified dataset.table form here.
+await runQuery(`
+  CREATE TABLE IF NOT EXISTS ${simDatasetId}.experiment_assignments (
+    run_id      STRING,
+    seed        INT64,
+    flag_key    STRING,
+    user_id     STRING,
+    variant     STRING,
+    assigned_at STRING
+  )
+`);
+
+await runQuery(`
+  CREATE TABLE IF NOT EXISTS ${simDatasetId}.experiment_facts (
+    run_id      STRING,
+    seed        INT64,
+    flag_key    STRING,
+    user_id     STRING,
+    variant     STRING,
+    metric_name STRING,
+    value       FLOAT64,
+    event_at    STRING
+  )
+`);
+
+// Export simDatasetId so routes can reference the correct dataset name.
+export { simDatasetId };
 
 // ---------------------------------------------------------------------------
 // INSERT default injection

@@ -79,6 +79,26 @@ raw.exec(`
     metrics        TEXT NOT NULL DEFAULT '[]',
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS sim_assignments (
+    run_id      TEXT NOT NULL,
+    seed        INTEGER NOT NULL,
+    flag_key    TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    variant     TEXT NOT NULL,
+    assigned_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sim_facts (
+    run_id      TEXT NOT NULL,
+    seed        INTEGER NOT NULL,
+    flag_key    TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    variant     TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    value       REAL NOT NULL,
+    event_at    TEXT NOT NULL
+  );
 `);
 
 // ---------------------------------------------------------------------------

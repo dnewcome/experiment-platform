@@ -69,6 +69,26 @@ async function bootstrap() {
       created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS sim_assignments (
+      run_id      TEXT NOT NULL,
+      seed        INTEGER NOT NULL,
+      flag_key    TEXT NOT NULL,
+      user_id     TEXT NOT NULL,
+      variant     TEXT NOT NULL,
+      assigned_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sim_facts (
+      run_id      TEXT NOT NULL,
+      seed        INTEGER NOT NULL,
+      flag_key    TEXT NOT NULL,
+      user_id     TEXT NOT NULL,
+      variant     TEXT NOT NULL,
+      metric_name TEXT NOT NULL,
+      value       REAL NOT NULL,
+      event_at    TIMESTAMPTZ NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);
   `);
 

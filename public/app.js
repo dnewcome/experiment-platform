@@ -1544,6 +1544,8 @@ function SimulateView() {
   const [varCfg,     setVarCfg]     = useState({});   // { variantKey: { rate: string } }
   const [results,    setResults]    = useState(null);
   const [seed,       setSeed]       = useState(() => Math.floor(Math.random() * 1e9));
+  const [writeToDb,  setWriteToDb]  = useState(false);
+  const [writeStatus, setWriteStatus] = useState(''); // '', 'writing', 'ok:<run_id>', 'error:<msg>'
 
   useEffect(() => { api.get('/flags').then(setFlags); }, []);
 
@@ -1620,6 +1622,29 @@ function SimulateView() {
     }
 
     setResults({ counts, conversions, tests, controlKey });
+    setWriteStatus('');
+
+    if (writeToDb) {
+      const runId = `sim-${Date.now()}-s${seed}`;
+      setWriteStatus('writing');
+      const variantPayload = Object.keys(counts).map(vk => ({
+        variant:     vk,
+        n:           counts[vk],
+        conversions: conversions[vk],
+      }));
+      const r = await api.post('/simulation/write', {
+        run_id:      runId,
+        seed,
+        flag_key:    flag.key,
+        metric_name: 'conversion',
+        variants:    variantPayload,
+      });
+      if (r.error) {
+        setWriteStatus(`error:${r.error}`);
+      } else {
+        setWriteStatus(`ok:${runId}`);
+      }
+    }
   }
 
   function pct(n)    { return (n * 100).toFixed(2) + '%'; }
@@ -1711,8 +1736,28 @@ function SimulateView() {
               </tbody>
             </table>
 
-            <div style={{ marginTop: 16 }}>
+            <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
               <button className="btn btn-primary" onClick={runSimulation}>Run Simulation</button>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+                <input type="checkbox" checked={writeToDb} onChange={e => setWriteToDb(e.target.checked)} />
+                Write to DB
+              </label>
+              {writeStatus === 'writing' && (
+                <span style={{ fontSize: 12, color: '#555' }}>Writing to database…</span>
+              )}
+              {writeStatus.startsWith('ok:') && (() => {
+                const runId = writeStatus.slice(3);
+                return (
+                  <span style={{ fontSize: 12, color: '#155724', background: '#d4edda', padding: '4px 10px', borderRadius: 4 }}>
+                    Written — run_id: <code style={{ fontFamily: 'monospace' }}>{runId}</code>
+                  </span>
+                );
+              })()}
+              {writeStatus.startsWith('error:') && (
+                <span style={{ fontSize: 12, color: '#721c24', background: '#f8d7da', padding: '4px 10px', borderRadius: 4 }}>
+                  {writeStatus.slice(6)}
+                </span>
+              )}
             </div>
           </div>
         )}
