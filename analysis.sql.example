@@ -1,0 +1,7 @@
+# Example analysis SQL
+
+## assignments
+SELECT user_id as entity_id, variant as variant, assigned_at FROM `gen-lang-client-0749458129.experiment_platform_simulation.experiment_assignments`
+
+## facts
+SELECT user_id as entity_id, value, event_at FROM `gen-lang-client-0749458129.experiment_platform_simulation.experiment_facts`
