@@ -533,6 +533,7 @@ function ResultsCard({ flag }) {
   const [metricNames,  setMetricNames]  = useState([]);
   const [metric,       setMetric]       = useState('');
   const [method,       setMethod]       = useState('fixed_sample');
+  const [nTarget,      setNTarget]      = useState(10000);
   const [results,      setResults]      = useState(null);
   const [loading,      setLoading]      = useState(false);
   const [importText,   setImportText]   = useState('');
@@ -593,7 +594,7 @@ function ResultsCard({ flag }) {
       const analysis = runAnalysis(
         { assigned: ctrl.assigned, mean: cMean, variance: cVar },
         { assigned: trt.assigned,  mean: tMean, variance: tVar },
-        method,
+        method, 0.05, nTarget,
       );
       const sp1 = flag.allocations[0]?.splits?.find(s => s.variant_key === ctrl.variant);
       const sp2 = flag.allocations[0]?.splits?.find(s => s.variant_key === trt.variant);
@@ -652,9 +653,17 @@ function ResultsCard({ flag }) {
           <select className="input" value={method} onChange={e => setMethod(e.target.value)}>
             <option value="fixed_sample">Fixed-sample</option>
             <option value="sequential">Sequential</option>
+            <option value="sequential_hybrid">Sequential hybrid</option>
             <option value="bayesian">Bayesian</option>
           </select>
         </div>
+        {method === 'sequential_hybrid' && (
+          <div>
+            <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Planned N (total)</div>
+            <input className="input" type="number" min="100" step="100" value={nTarget}
+              onChange={e => setNTarget(Number(e.target.value))} style={{ width: 120 }} />
+          </div>
+        )}
         <div style={{ alignSelf: 'flex-end' }}>
           <button className="btn btn-primary" onClick={loadResults} disabled={!metric || loading}>
             {loading ? 'Loading…' : 'Analyze'}
@@ -712,7 +721,8 @@ function ResultsCard({ flag }) {
             const { bg, tx } = sig && powOk ? { bg: '#d4edda', tx: '#155724' }
                              : sig          ? { bg: '#fff3cd', tx: '#856404' }
                              :                { bg: '#f8d7da', tx: '#721c24' };
-            const ciLabel = { sequential: 'Anytime-valid 95% CI', bayesian: '95% credible interval' }[analysis.method] ?? '95% CI';
+            const isSeq = analysis.method === 'sequential' || analysis.method === 'sequential_hybrid';
+            const ciLabel = { sequential: 'Anytime-valid 95% CI', sequential_hybrid: 'Anytime-valid 95% CI (hybrid)', bayesian: '95% credible interval' }[analysis.method] ?? '95% CI';
             const statField = analysis.method === 'bayesian'
               ? ['P(treatment > control)', pct(analysis.probPositive)]
               : ['p-value', analysis.pValue != null ? fmt(analysis.pValue, 4) : (sig ? '< α' : '> α')];
@@ -720,7 +730,7 @@ function ResultsCard({ flag }) {
               ? (analysis.probPositive >= 0.95 ? `Treatment better with ${pct(analysis.probPositive)} probability`
                 : analysis.probPositive <= 0.05 ? `Control better — P(T > C) = ${pct(analysis.probPositive)}`
                 : `Inconclusive — P(treatment > control) = ${pct(analysis.probPositive)}`)
-              : analysis.method === 'sequential'
+              : isSeq
                 ? (sig ? `Anytime-valid result: ${relPct(analysis.lift)} relative lift` : `No conclusion yet — CI contains 0`)
                 : (analysis.pValue < 0.05 && pow < 0.6 ? `Significant but underpowered (p = ${fmt(analysis.pValue,4)})`
                   : analysis.pValue < 0.05 ? `Statistically significant (p = ${fmt(analysis.pValue,4)})`
@@ -1411,6 +1421,17 @@ function sequentialCI(lift, sigmaDelta, t, alpha = 0.05) {
   return { lo: lift - B * sigmaDelta, hi: lift + B * sigmaDelta, B, method: 'sequential' };
 }
 
+// Sequential hybrid CI — same Howard et al. formula, but ρ is tuned to nTarget
+// (the planned total sample size) rather than a fixed 10,000.  This makes the
+// confidence sequence as tight as possible at the planned stopping point while
+// remaining valid at every earlier peek.
+function sequentialHybridCI(lift, sigmaDelta, t, nTarget, alpha = 0.05) {
+  if (!sigmaDelta || !isFinite(sigmaDelta) || t < 2) return null;
+  const rho = nTarget / (Math.log(Math.log(Math.E / alpha ** 2)) - 2 * Math.log(alpha));
+  const B   = Math.sqrt((t + rho) * Math.log((t + rho) / (rho * alpha ** 2))) / Math.sqrt(t);
+  return { lo: lift - B * sigmaDelta, hi: lift + B * sigmaDelta, B, nTarget, method: 'sequential_hybrid' };
+}
+
 // Bayesian CI — Gaussian prior N(0, σ²=0.05²) on relative lift (Eppo's prior).
 // Posterior is weighted average of prior and likelihood.
 function bayesianGaussianCI(lift, sigmaDelta, alpha = 0.05) {
@@ -1426,17 +1447,19 @@ function bayesianGaussianCI(lift, sigmaDelta, alpha = 0.05) {
 }
 
 // Unified entry point. ctrl/trt: { assigned, mean, variance }
-// method: 'fixed_sample' | 'sequential' | 'bayesian'
-function runAnalysis(ctrl, trt, method = 'fixed_sample', alpha = 0.05) {
+// method: 'fixed_sample' | 'sequential' | 'sequential_hybrid' | 'bayesian'
+// nTarget: required for sequential_hybrid — planned total sample size
+function runAnalysis(ctrl, trt, method = 'fixed_sample', alpha = 0.05, nTarget = 10000) {
   const { lift, sigmaDelta } = deltaMethodLift(
     ctrl.assigned, ctrl.mean, ctrl.variance,
     trt.assigned,  trt.mean,  trt.variance,
   );
   const t = ctrl.assigned + trt.assigned;
   switch (method) {
-    case 'sequential': return { lift, sigmaDelta, ...sequentialCI(lift, sigmaDelta, t, alpha) };
-    case 'bayesian':   return { lift, sigmaDelta, ...bayesianGaussianCI(lift, sigmaDelta, alpha) };
-    default:           return { lift, sigmaDelta, ...fixedSampleCI(lift, sigmaDelta, alpha) };
+    case 'sequential':        return { lift, sigmaDelta, ...sequentialCI(lift, sigmaDelta, t, alpha) };
+    case 'sequential_hybrid': return { lift, sigmaDelta, ...sequentialHybridCI(lift, sigmaDelta, t, nTarget, alpha) };
+    case 'bayesian':          return { lift, sigmaDelta, ...bayesianGaussianCI(lift, sigmaDelta, alpha) };
+    default:                  return { lift, sigmaDelta, ...fixedSampleCI(lift, sigmaDelta, alpha) };
   }
 }
 
@@ -1513,6 +1536,7 @@ function SimulateView() {
   const [flag,       setFlag]       = useState(null);
   const [nUsers,     setNUsers]     = useState(1000);
   const [method,     setMethod]     = useState('fixed_sample');
+  const [nTarget,    setNTarget]    = useState(10000);
   const [varCfg,     setVarCfg]     = useState({});   // { variantKey: { rate: string } }
   const [results,    setResults]    = useState(null);
   const [seed,       setSeed]       = useState(() => Math.floor(Math.random() * 1e9));
@@ -1584,7 +1608,7 @@ function SimulateView() {
       const analysis = runAnalysis(
         { assigned: n1, mean: m1, variance: m1 * (1 - m1) },
         { assigned: n2, mean: m2, variance: m2 * (1 - m2) },
-        method,
+        method, 0.05, nTarget,
       );
       const pow = computePower(n1, n2, p1true, p2true);
       const req = requiredNTotal(p1true, p2true, w1, w2);
@@ -1633,9 +1657,17 @@ function SimulateView() {
             <select className="input" value={method} onChange={e => setMethod(e.target.value)}>
               <option value="fixed_sample">Fixed-sample</option>
               <option value="sequential">Sequential</option>
+              <option value="sequential_hybrid">Sequential hybrid</option>
               <option value="bayesian">Bayesian</option>
             </select>
           </div>
+          {method === 'sequential_hybrid' && (
+            <div>
+              <div style={{ fontSize: 12, color: '#555', marginBottom: 4 }}>Planned N (total)</div>
+              <input className="input" type="number" min="100" step="100" value={nTarget}
+                onChange={e => setNTarget(Number(e.target.value))} style={{ width: 120 }} />
+            </div>
+          )}
         </div>
 
         {flag && hasVariants && hasAlloc && (
@@ -1729,7 +1761,7 @@ function SimulateView() {
           <div className="card">
             <h2 style={{ marginBottom: 2 }}>Statistical Analysis
               <span style={{ fontWeight: 400, fontSize: 13, color: '#666', marginLeft: 10 }}>
-                {{ fixed_sample: 'Fixed-sample · δ-method CI on relative lift', sequential: 'Sequential · Howard et al. anytime-valid CI', bayesian: 'Bayesian · Gaussian prior N(0, 0.05²) on lift' }[method]}
+                {{ fixed_sample: 'Fixed-sample · δ-method CI on relative lift', sequential: 'Sequential · Howard et al. anytime-valid CI', sequential_hybrid: `Sequential hybrid · anytime-valid, tuned to N=${nTarget.toLocaleString()}`, bayesian: 'Bayesian · Gaussian prior N(0, 0.05²) on lift' }[method]}
               </span>
             </h2>
             <div className="muted" style={{ marginBottom: 16, fontSize: 12 }}>
@@ -1748,7 +1780,8 @@ function SimulateView() {
                 const { bg, tx } = sig && powOk ? { bg: '#d4edda', tx: '#155724' }
                                  : sig          ? { bg: '#fff3cd', tx: '#856404' }
                                  :                { bg: '#f8d7da', tx: '#721c24' };
-                const ciLabel = { sequential: 'Anytime-valid 95% CI', bayesian: '95% credible interval' }[analysis.method] ?? '95% CI';
+                const isSeq = analysis.method === 'sequential' || analysis.method === 'sequential_hybrid';
+                const ciLabel = { sequential: 'Anytime-valid 95% CI', sequential_hybrid: 'Anytime-valid 95% CI (hybrid)', bayesian: '95% credible interval' }[analysis.method] ?? '95% CI';
                 const statField = analysis.method === 'bayesian'
                   ? ['P(treatment > control)', pct(analysis.probPositive)]
                   : ['p-value', analysis.pValue != null ? fmt(analysis.pValue, 4) : (sig ? '< α' : '> α')];
@@ -1756,7 +1789,7 @@ function SimulateView() {
                   ? (analysis.probPositive >= 0.95 ? `Treatment better with ${pct(analysis.probPositive)} probability`
                     : analysis.probPositive <= 0.05 ? `Control better — P(T > C) = ${pct(analysis.probPositive)}`
                     : `Inconclusive — P(treatment > control) = ${pct(analysis.probPositive)}`)
-                  : analysis.method === 'sequential'
+                  : isSeq
                     ? (sig ? `Anytime-valid result: ${relPct(analysis.lift)} relative lift` : `No conclusion yet — CI contains 0`)
                     : (analysis.pValue < 0.05 && power < 0.6 ? `Significant but underpowered (p = ${fmt(analysis.pValue,4)})`
                       : analysis.pValue < 0.05 ? `Statistically significant (p = ${fmt(analysis.pValue,4)})`
