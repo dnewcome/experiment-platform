@@ -1874,6 +1874,7 @@ function WarehouseView() {
   const [running,       setRunning]       = useState(false);
   const [results,       setResults]       = useState([]);    // [{metric_name, variants, analyses}]
   const [error,         setError]         = useState('');
+  const [previews,      setPreviews]      = useState({});    // { key: {rows, error, loading} }
 
   useEffect(() => { refreshConfigs(); }, []);
 
@@ -1966,6 +1967,43 @@ function WarehouseView() {
     setMetrics(ms => ms.filter((_, j) => j !== i));
   }
 
+  async function previewSql(key, sql) {
+    if (!sql?.trim()) return;
+    setPreviews(p => ({ ...p, [key]: { loading: true, rows: null, error: null } }));
+    const r = await api.post('/analysis/preview', { sql });
+    if (r.error) {
+      setPreviews(p => ({ ...p, [key]: { loading: false, rows: null, error: r.error } }));
+    } else {
+      setPreviews(p => ({ ...p, [key]: { loading: false, rows: r.rows, error: null } }));
+    }
+  }
+
+  function PreviewResult({ previewKey }) {
+    const p = previews[previewKey];
+    if (!p) return null;
+    if (p.loading) return <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>Running…</div>;
+    if (p.error)   return <div style={{ fontSize: 12, color: '#721c24', background: '#f8d7da', padding: '6px 10px', borderRadius: 4, marginTop: 6, fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{p.error}</div>;
+    if (!p.rows?.length) return <div style={{ fontSize: 12, color: '#888', marginTop: 6 }}>No rows returned.</div>;
+    const cols = Object.keys(p.rows[0]);
+    return (
+      <div style={{ marginTop: 8, overflowX: 'auto' }}>
+        <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>First {p.rows.length} row{p.rows.length !== 1 ? 's' : ''}</div>
+        <table style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+          <thead>
+            <tr>{cols.map(c => <th key={c} style={{ fontFamily: 'monospace' }}>{c}</th>)}</tr>
+          </thead>
+          <tbody>
+            {p.rows.map((row, i) => (
+              <tr key={i}>
+                {cols.map(c => <td key={c} style={{ fontFamily: 'monospace' }}>{row[c] == null ? <span style={{ color: '#aaa' }}>NULL</span> : String(row[c])}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
   const pct    = n => (n * 100).toFixed(2) + '%';
   const fmt    = (n, d=4) => n.toFixed(d);
   const relPct = n => (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%';
@@ -1995,11 +2033,17 @@ function WarehouseView() {
 
         {/* ── Assignment SQL ── */}
         <div style={{ marginBottom: 16 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: '#555', marginBottom: 6 }}>
-            Assignment SQL
-            <span style={{ fontWeight: 400, marginLeft: 8, color: '#888' }}>
-              must return <code>entity_id</code>, <code>variant</code>, <code>assigned_at</code>
-            </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>
+              Assignment SQL
+              <span style={{ fontWeight: 400, marginLeft: 8, color: '#888' }}>
+                must return <code>entity_id</code>, <code>variant</code>, <code>assigned_at</code>
+              </span>
+            </div>
+            <button className="btn btn-sm" onClick={() => previewSql('assignment', assignSql)}
+              disabled={!assignSql.trim() || previews.assignment?.loading}>
+              {previews.assignment?.loading ? 'Running…' : 'Preview'}
+            </button>
           </div>
           <textarea
             className="input"
@@ -2008,6 +2052,7 @@ function WarehouseView() {
             value={assignSql}
             onChange={e => setAssignSql(e.target.value)}
           />
+          <PreviewResult previewKey="assignment" />
         </div>
 
         {/* ── Metrics ── */}
@@ -2027,6 +2072,10 @@ function WarehouseView() {
                 <input className="input" placeholder="Metric name" value={m.name}
                   onChange={e => setMetricField(i, 'name', e.target.value)}
                   style={{ width: 180, fontSize: 12 }} />
+                <button className="btn btn-sm" onClick={() => previewSql(`metric-${i}`, m.sql)}
+                  disabled={!m.sql.trim() || previews[`metric-${i}`]?.loading}>
+                  {previews[`metric-${i}`]?.loading ? 'Running…' : 'Preview'}
+                </button>
                 {metrics.length > 1 && (
                   <button className="btn btn-sm" onClick={() => removeMetric(i)} style={{ marginLeft: 'auto' }}>✕ Remove</button>
                 )}
@@ -2038,6 +2087,7 @@ function WarehouseView() {
                 value={m.sql}
                 onChange={e => setMetricField(i, 'sql', e.target.value)}
               />
+              <PreviewResult previewKey={`metric-${i}`} />
             </div>
           ))}
         </div>

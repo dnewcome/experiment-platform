@@ -23,6 +23,27 @@ import db from '../db/index.js';
 
 export default async function analysisRoutes(app) {
 
+  // ── Preview ───────────────────────────────────────────────────────────────
+
+  // POST /analysis/preview
+  // Body: { sql }
+  // Wraps the user's SQL in a subquery and returns the first 10 rows.
+  // Useful for verifying column names / shape before running a full analysis.
+  app.post('/analysis/preview', async (req, reply) => {
+    const { sql } = req.body ?? {};
+    if (!sql?.trim()) return reply.code(400).send({ error: 'sql is required' });
+
+    // Subquery alias is required by Postgres; harmless on SQLite and BigQuery.
+    const previewSql = `SELECT * FROM (\n${sql}\n) AS _preview LIMIT 10`;
+
+    try {
+      const rows = await db.all(previewSql);
+      return { rows };
+    } catch (err) {
+      return reply.code(400).send({ error: err.message });
+    }
+  });
+
   // ── Run ───────────────────────────────────────────────────────────────────
 
   // POST /analysis/run
