@@ -113,7 +113,11 @@ export default async function analysisRoutes(app) {
         }),
       };
     } catch (err) {
-      return reply.code(400).send({ error: err.message });
+      let msg = err.message;
+      if (/entity_id/i.test(msg)) {
+        msg = `Column 'entity_id' not found. Both assignment_sql and metric_sql must alias the user/entity id column as entity_id, e.g.:\n  SELECT user_id AS entity_id, ...\n\nOriginal error: ${msg}`;
+      }
+      return reply.code(400).send({ error: msg });
     }
   });
 

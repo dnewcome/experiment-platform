@@ -1924,17 +1924,37 @@ function PreviewResult({ preview }) {
 // Configs are saved to warehouse_configs and run against the active DB adapter
 // (SQLite, Postgres, or BigQuery), so the query literally hits your warehouse.
 
-const ASSIGN_PLACEHOLDER = `-- Must return: entity_id, variant, assigned_at
--- Example (BigQuery):
+const ASSIGN_PLACEHOLDER = `-- Must return columns named exactly: entity_id, variant, assigned_at
+-- The entity id column MUST be aliased AS entity_id.
+--
+-- Example — simulation data:
 SELECT
-  user_id        AS entity_id,
-  variant_key    AS variant,
+  user_id     AS entity_id,
+  variant,
+  assigned_at
+FROM \`myproject.experiment_platform_simulation.experiment_assignments\`
+WHERE run_id = 'sim-...'
+--
+-- Example — production data:
+SELECT
+  user_id     AS entity_id,
+  variant_key AS variant,
   assigned_at
 FROM \`myproject.dataset.experiment_assignments\`
 WHERE experiment_key = 'my-flag-key'`;
 
-const METRIC_PLACEHOLDER = `-- Must return: entity_id, value, event_at
--- Example (BigQuery):
+const METRIC_PLACEHOLDER = `-- Must return columns named exactly: entity_id, value, event_at
+-- The entity id column MUST be aliased AS entity_id.
+--
+-- Example — simulation data:
+SELECT
+  user_id  AS entity_id,
+  value,
+  event_at
+FROM \`myproject.experiment_platform_simulation.experiment_facts\`
+WHERE run_id = 'sim-...' AND metric_name = 'conversion'
+--
+-- Example — production data:
 SELECT
   user_id      AS entity_id,
   1            AS value,
