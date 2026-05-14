@@ -7,6 +7,7 @@ import evaluateRoute from './routes/evaluate.js';
 import metricsRoutes from './routes/metrics.js';
 import analysisRoutes from './routes/analysis.js';
 import simulationRoutes from './routes/simulation.js';
+import ofrepRoutes from './routes/ofrep.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -23,7 +24,7 @@ await app.register(staticPlugin, {
 // /api requests. Leave unset for unauthenticated local development.
 if (process.env.API_KEY) {
   app.addHook('onRequest', async (req, reply) => {
-    if (!req.url.startsWith('/api')) return;
+    if (!req.url.startsWith('/api') && !req.url.startsWith('/ofrep')) return;
     const auth = req.headers['authorization'] ?? '';
     if (auth !== `Bearer ${process.env.API_KEY}`) {
       reply.code(401).send({ error: 'Unauthorized' });
@@ -36,6 +37,7 @@ await app.register(evaluateRoute, { prefix: '/api' });
 await app.register(metricsRoutes, { prefix: '/api' });
 await app.register(analysisRoutes,   { prefix: '/api' });
 await app.register(simulationRoutes, { prefix: '/api' });
+await app.register(ofrepRoutes,      { prefix: '/ofrep' });
 
 app.setNotFoundHandler((_req, reply) => {
   reply.sendFile('index.html');
